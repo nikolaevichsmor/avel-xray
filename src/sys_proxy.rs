@@ -521,6 +521,69 @@ pub fn open_folder_in_explorer(dir: &std::path::Path) {
     }
 }
 
+// Spawn a detached System32 PowerShell helper that waits for this process to exit,
+// extracts the verified release zip over avel.exe and core/ (preserving state.json),
+// cleans up _update/, and relaunches the updated binary.
+pub fn spawn_self_update_helper(
+    zip_path: &std::path::Path,
+    app_dir: &std::path::Path,
+    reconnect_after: bool,
+) -> Result<(), String> {
+    let ps = system32_exe(r"WindowsPowerShell\v1.0\powershell.exe");
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+$pidToWait = [int]$env:AVEL_UPD_PID
+$zip = $env:AVEL_UPD_ZIP
+$dst = $env:AVEL_UPD_DIR
+$reconn = $env:AVEL_UPD_RECONNECT
+for ($i = 0; $i -lt 100; $i++) {
+    if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) { break }
+    Start-Sleep -Milliseconds 150
+}
+Start-Sleep -Milliseconds 250
+$updDir = Split-Path -Parent $zip
+$extDir = Join-Path $updDir 'extracted'
+if (Test-Path $extDir) { Remove-Item -Recurse -Force $extDir }
+Expand-Archive -Path $zip -DestinationPath $extDir -Force
+$srcRoot = Join-Path $extDir 'avel-xray'
+if (-not (Test-Path (Join-Path $srcRoot 'avel.exe'))) { $srcRoot = $extDir }
+$newExe = Join-Path $srcRoot 'avel.exe'
+if (-not (Test-Path $newExe)) { exit 1 }
+Copy-Item -Path $newExe -Destination (Join-Path $dst 'avel.exe') -Force
+$srcCore = Join-Path $srcRoot 'core'
+$dstCore = Join-Path $dst 'core'
+if (Test-Path $srcCore) {
+    New-Item -ItemType Directory -Force -Path $dstCore | Out-Null
+    foreach ($f in @('avel-core.exe', 'wintun.dll', 'geoip.dat', 'geosite.dat')) {
+        $p = Join-Path $srcCore $f
+        if (Test-Path $p) { Copy-Item -Path $p -Destination (Join-Path $dstCore $f) -Force }
+    }
+}
+foreach ($doc in @('LICENSE', 'THIRD_PARTY_LICENSES.txt')) {
+    $p = Join-Path $srcRoot $doc
+    if (Test-Path $p) { Copy-Item -Path $p -Destination (Join-Path $dst $doc) -Force }
+}
+Remove-Item -Recurse -Force $updDir -ErrorAction SilentlyContinue
+$exePath = Join-Path $dst 'avel.exe'
+if ($reconn -eq '1') {
+    Start-Process -FilePath $exePath -ArgumentList '--autoconnect'
+} else {
+    Start-Process -FilePath $exePath
+}
+"#;
+
+    Command::new(&ps)
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .env("AVEL_UPD_PID", std::process::id().to_string())
+        .env("AVEL_UPD_ZIP", zip_path)
+        .env("AVEL_UPD_DIR", app_dir)
+        .env("AVEL_UPD_RECONNECT", if reconnect_after { "1" } else { "0" })
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("Failed to start update helper: {}", e))?;
+    Ok(())
+}
+
 // List running user .exe names for the routing rule picker.
 pub fn list_running_user_processes() -> Vec<String> {
     const SYSTEM_SKIP: &[&str] = &[
