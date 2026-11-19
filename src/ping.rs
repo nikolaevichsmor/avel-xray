@@ -1,7 +1,8 @@
-use crate::model::VlessNode;
+use crate::model::{StabilityStats, VlessNode};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::ptr::null_mut;
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetAdaptersAddresses, GAA_FLAG_INCLUDE_GATEWAYS, IP_ADAPTER_ADDRESSES_LH,
@@ -169,33 +170,140 @@ fn tcp_ping_direct_ipv4(ip: Ipv4Addr, port: u16, if_idx: u32, timeout_ms: i32) -
     }
 }
 
-pub fn tcp_ping_node(address: &str, port: u16, phys_if: Option<u32>) -> u32 {
-    let target = format!("{}:{}", address, port);
-    let Ok(addrs) = target.to_socket_addrs() else {
-        return 0;
-    };
-    let addrs_vec: Vec<SocketAddr> = addrs.collect();
-
-    // Prefer direct physical-interface IPv4 TCP ping so active TUN never fakes 1 ms
+fn probe_resolved_addrs(
+    addrs_vec: &[SocketAddr],
+    port: u16,
+    phys_if: Option<u32>,
+    timeout_ms: i32,
+) -> u32 {
     if let Some(if_idx) = phys_if {
-        for sa in &addrs_vec {
+        for sa in addrs_vec {
             if let IpAddr::V4(v4) = sa.ip() {
-                if let Some(ms) = tcp_ping_direct_ipv4(v4, port, if_idx, 2000) {
+                if let Some(ms) = tcp_ping_direct_ipv4(v4, port, if_idx, timeout_ms) {
                     return ms;
                 }
             }
         }
     }
 
-    // Fallback (e.g., IPv6-only or no physical gateway detected)
-    let timeout = Duration::from_millis(2000);
+    let timeout = Duration::from_millis(timeout_ms.max(100) as u64);
     for sa in addrs_vec {
         let start = Instant::now();
-        if TcpStream::connect_timeout(&sa, timeout).is_ok() {
+        if TcpStream::connect_timeout(sa, timeout).is_ok() {
             return (start.elapsed().as_millis() as u32).max(1);
         }
     }
     0
+}
+
+pub fn tcp_ping_node(address: &str, port: u16, phys_if: Option<u32>) -> u32 {
+    let target = format!("{}:{}", address, port);
+    let Ok(addrs) = target.to_socket_addrs() else {
+        return 0;
+    };
+    let addrs_vec: Vec<SocketAddr> = addrs.collect();
+    probe_resolved_addrs(&addrs_vec, port, phys_if, 2000)
+}
+
+pub fn compute_stability_stats(samples: &[u32], probes_total: u8) -> StabilityStats {
+    let done = samples.len().min(u8::MAX as usize) as u8;
+    let ok: Vec<u32> = samples.iter().copied().filter(|&ms| ms > 0).collect();
+    if done == 0 || ok.is_empty() {
+        return StabilityStats {
+            probes_done: done,
+            probes_total,
+            avg_ms: 0,
+            jitter_ms: 0,
+            loss_pct: if done == 0 { 0 } else { 100 },
+        };
+    }
+
+    let failed = (done as usize).saturating_sub(ok.len());
+    let loss_pct = ((failed * 100 + (done as usize) / 2) / (done as usize)).min(100) as u8;
+    let sum: u64 = ok.iter().map(|&v| v as u64).sum();
+    let avg_ms = ((sum + (ok.len() as u64) / 2) / (ok.len() as u64)) as u32;
+
+    let jitter_ms = if ok.len() >= 2 {
+        let diff_sum: u64 = ok
+            .windows(2)
+            .map(|w| w[0].abs_diff(w[1]) as u64)
+            .sum();
+        let cnt = (ok.len() - 1) as u64;
+        ((diff_sum + cnt / 2) / cnt) as u32
+    } else {
+        0
+    };
+
+    StabilityStats {
+        probes_done: done,
+        probes_total,
+        avg_ms,
+        jitter_ms,
+        loss_pct,
+    }
+}
+
+pub fn stability_test_all_async(
+    nodes: Vec<(usize, String, u16)>,
+    probes: u8,
+    interval_ms: u64,
+    cancel: Arc<AtomicBool>,
+    on_progress: impl Fn(usize, StabilityStats) + Send + Sync + 'static,
+    on_done: impl Fn() + Send + 'static,
+) {
+    let cb = Arc::new(on_progress);
+    let total = probes.max(1);
+    std::thread::spawn(move || {
+        let phys_if = find_physical_ipv4_if_index();
+        for chunk in nodes.chunks(8) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let mut handles = Vec::new();
+            for &(idx, ref addr, port) in chunk {
+                let a = addr.clone();
+                let c = cb.clone();
+                let cancel_t = cancel.clone();
+                handles.push(std::thread::spawn(move || {
+                    let target = format!("{}:{}", a, port);
+                    let addrs_vec: Vec<SocketAddr> = target
+                        .to_socket_addrs()
+                        .map(|it| it.collect())
+                        .unwrap_or_default();
+
+                    let mut samples: Vec<u32> = Vec::with_capacity(total as usize);
+                    for p in 0..total {
+                        if cancel_t.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let t0 = Instant::now();
+                        let ms = if addrs_vec.is_empty() {
+                            0
+                        } else {
+                            probe_resolved_addrs(&addrs_vec, port, phys_if, 1500)
+                        };
+                        samples.push(ms);
+                        let stats = compute_stability_stats(&samples, total);
+                        c(idx, stats);
+
+                        if p + 1 < total {
+                            let elapsed = t0.elapsed().as_millis() as u64;
+                            let mut rem = interval_ms.saturating_sub(elapsed);
+                            while rem > 0 && !cancel_t.load(Ordering::Relaxed) {
+                                let step = rem.min(50);
+                                std::thread::sleep(Duration::from_millis(step));
+                                rem -= step;
+                            }
+                        }
+                    }
+                }));
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+        }
+        on_done();
+    });
 }
 
 pub fn ping_all_async(
@@ -242,5 +350,26 @@ mod tests {
         assert!(phys.is_some(), "Expected an active physical IPv4 interface");
         let ms = tcp_ping_node("1.1.1.1", 443, phys);
         assert!(ms >= 5 && ms < 2000, "Expected real physical TCP RTT (5..2000 ms), got {} ms", ms);
+    }
+
+    #[test]
+    fn compute_stability_stats_metrics_and_quality() {
+        let good = compute_stability_stats(&[30, 32, 31, 33, 30, 32, 31, 30, 32, 31], 10);
+        assert_eq!(good.avg_ms, 31);
+        assert_eq!(good.jitter_ms, 2);
+        assert_eq!(good.loss_pct, 0);
+        assert_eq!(good.quality_label(), "Good");
+
+        let fair = compute_stability_stats(&[95, 110, 100, 115, 98], 5);
+        assert_eq!(fair.loss_pct, 0);
+        assert_eq!(fair.quality_label(), "Fair");
+
+        let lossy = compute_stability_stats(&[30, 0, 32, 31, 30], 5);
+        assert_eq!(lossy.loss_pct, 20);
+        assert_eq!(lossy.quality_label(), "Poor");
+
+        let dead = compute_stability_stats(&[0, 0, 0], 3);
+        assert_eq!(dead.loss_pct, 100);
+        assert_eq!(dead.quality_label(), "Dead");
     }
 }

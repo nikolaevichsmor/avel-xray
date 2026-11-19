@@ -246,6 +246,7 @@ pub fn parse_vless_uri(uri: &str) -> Result<VlessNode, String> {
         extra: get_p("extra"),
         raw_uri: uri.trim().to_string(),
         ping_ms: None,
+        stability: None,
     })
 }
 
@@ -330,6 +331,7 @@ pub fn parse_trojan_uri(uri: &str) -> Result<VlessNode, String> {
         extra: get_p("extra"),
         raw_uri: uri.trim().to_string(),
         ping_ms: None,
+        stability: None,
     })
 }
 
@@ -410,6 +412,7 @@ pub fn parse_ss_uri(uri: &str) -> Result<VlessNode, String> {
         extra: String::new(),
         raw_uri: uri.trim().to_string(),
         ping_ms: None,
+        stability: None,
     })
 }
 

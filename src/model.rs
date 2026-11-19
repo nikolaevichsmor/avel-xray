@@ -249,6 +249,51 @@ impl RoutingRule {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StabilityStats {
+    pub probes_done: u8,
+    pub probes_total: u8,
+    pub avg_ms: u32,
+    pub jitter_ms: u32,
+    pub loss_pct: u8,
+}
+
+impl StabilityStats {
+    pub fn quality_label(&self) -> &'static str {
+        if self.loss_pct >= 100 {
+            "Dead"
+        } else if self.loss_pct == 0 && self.avg_ms <= 80 && self.jitter_ms <= 10 {
+            "Good"
+        } else if self.loss_pct == 0 && self.avg_ms <= 150 && self.jitter_ms <= 25 {
+            "Fair"
+        } else {
+            "Poor"
+        }
+    }
+
+    pub fn format_badge(&self) -> String {
+        if self.probes_done < self.probes_total {
+            if self.loss_pct >= 100 {
+                format!("{}/{} loss", self.probes_done, self.probes_total)
+            } else {
+                format!(
+                    "{}/{} ±{}ms {}%",
+                    self.probes_done, self.probes_total, self.jitter_ms, self.loss_pct
+                )
+            }
+        } else if self.loss_pct >= 100 {
+            "Dead 100%".to_string()
+        } else {
+            format!(
+                "{} ±{}ms {}%",
+                self.quality_label(),
+                self.jitter_ms,
+                self.loss_pct
+            )
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VlessNode {
     pub name: String,
@@ -297,6 +342,8 @@ pub struct VlessNode {
     pub raw_uri: String,
     #[serde(skip)]
     pub ping_ms: Option<u32>,
+    #[serde(skip)]
+    pub stability: Option<StabilityStats>,
 }
 
 fn default_protocol() -> String {
@@ -313,7 +360,7 @@ fn default_network() -> String {
 }
 
 impl VlessNode {
-    pub fn display_row(&self) -> String {
+    pub fn display_details(&self) -> String {
         let ping = match self.ping_ms {
             Some(0) => "timeout".to_string(),
             Some(ms) => format!("{} ms", ms),
@@ -337,10 +384,24 @@ impl VlessNode {
                 format!("{}/{}", self.network, sec)
             }
         };
-        format!(
-            "{}  [{}:{}, {}]  [{}]",
-            self.name, self.address, self.port, proto_tag, ping
-        )
+        match self.stability {
+            Some(st) => format!(
+                "  [{}:{}, {}]  [{}]  [{}]",
+                self.address,
+                self.port,
+                proto_tag,
+                ping,
+                st.format_badge()
+            ),
+            None => format!(
+                "  [{}:{}, {}]  [{}]",
+                self.address, self.port, proto_tag, ping
+            ),
+        }
+    }
+
+    pub fn display_row(&self) -> String {
+        format!("{}{}", self.name, self.display_details())
     }
 }
 
