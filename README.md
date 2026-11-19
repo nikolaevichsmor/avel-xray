@@ -1,19 +1,13 @@
-<p>
-  <img src="assets/logo.svg" alt="avel-xray" width="96" height="96">
-</p>
-
-# avel-xray
+<h1>
+  <img src="assets/logo.svg" alt="avel-xray" width="64" height="64" align="absmiddle">&nbsp;&nbsp;avel-xray
+</h1>
 
 <p>
   <a href="https://github.com/nikolaevichsmor/avel-xray/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/nikolaevichsmor/avel-xray/release.yml?label=build" alt="build"></a>
   <a href="https://github.com/nikolaevichsmor/avel-xray/releases/latest"><img src="https://img.shields.io/github/v/release/nikolaevichsmor/avel-xray?label=version" alt="version"></a>
-  <img src="https://img.shields.io/github/repo-size/nikolaevichsmor/avel-xray" alt="repo size">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/nikolaevichsmor/avel-xray" alt="license"></a>
-  <br>
   <img src="https://img.shields.io/github/commit-activity/m/nikolaevichsmor/avel-xray" alt="commit activity">
   <a href="https://github.com/nikolaevichsmor/avel-xray/releases/latest"><img src="https://img.shields.io/github/release-date/nikolaevichsmor/avel-xray?label=release%20date" alt="release date"></a>
-  <a href="https://github.com/nikolaevichsmor/avel-xray/stargazers"><img src="https://img.shields.io/github/stars/nikolaevichsmor/avel-xray?style=social" alt="Stars"></a>
-  <a href="https://github.com/nikolaevichsmor/avel-xray/releases"><img src="https://img.shields.io/github/downloads/nikolaevichsmor/avel-xray/total?label=downloads" alt="downloads"></a>
 </p>
 
 Native Win32 VPN client for Xray-core on Windows x64, written in Rust directly against the Windows API. Built to stay fast, quiet, and battery-friendly without Electron, Qt, Flutter, or WebView2.
