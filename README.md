@@ -7,11 +7,8 @@
   <a href="https://github.com/nikolaevichsmor/avel-xray/releases/latest"><img src="https://img.shields.io/github/v/release/nikolaevichsmor/avel-xray?label=version" alt="version"></a>
   <a href="https://github.com/nikolaevichsmor/avel-xray/releases/latest"><img src="https://img.shields.io/github/release-date/nikolaevichsmor/avel-xray?label=release%20date" alt="release date"></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/nikolaevichsmor/avel-xray" alt="license"></a>
-  <br>
   <a href="https://github.com/XTLS/Xray-core"><img src="https://img.shields.io/badge/core-Xray%20v26.11.9-2563EB" alt="core"></a>
-  <img src="https://img.shields.io/badge/protocols-VLESS%20%2F%20Trojan%20%2F%20SS-1E40AF" alt="protocols">
   <a href="https://www.wintun.net/"><img src="https://img.shields.io/badge/TUN-Wintun-0EA5E9" alt="TUN"></a>
-  <img src="https://img.shields.io/badge/platform-Windows%20x64-0078D6" alt="platform">
 </p>
 
 Native Win32 VPN client for Xray-core on Windows x64, written in Rust directly against the Windows API.
