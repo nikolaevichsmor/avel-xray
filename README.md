@@ -10,37 +10,21 @@
   <a href="https://github.com/nikolaevichsmor/avel-xray/releases/latest"><img src="https://img.shields.io/github/release-date/nikolaevichsmor/avel-xray?label=release%20date" alt="release date"></a>
 </p>
 
-Native Win32 VPN client for Xray-core on Windows x64, written in Rust directly against the Windows API. Built to stay fast, quiet, and battery-friendly without Electron, Qt, Flutter, or WebView2.
+Native Win32 VPN client for Xray-core on Windows x64, written in Rust directly against the Windows API.
 
-## Why avel-xray
+## Why avel-xray?
 
-| | Electron / Flutter / Qt clients | avel-xray |
-| :--- | :--- | :--- |
-| GUI stack | Chromium / Skia / Qt6 / .NET | Native Win32 API (Rust) |
-| GUI memory | ~80-250 MB RAM | ~5 MB RAM |
-| GPU VRAM | ~30-120 MB (can wake dGPU) | 0 MB |
-| GUI executable | ~30-120 MB | ~700 KB |
-| Background service | 24/7 SYSTEM daemon | None |
+Most desktop Xray clients bundle a browser engine, Flutter, Qt, or .NET runtime, taking 80-250 MB of RAM and holding GPU VRAM even when sitting in the tray. `avel-xray` is a ~700 KB native Win32 executable that stays around 5 MB of RAM and 0 MB of VRAM, so it never wakes a laptop discrete GPU or eats memory in the background. In Global and process-only modes it skips loading `geoip.dat` and `geosite.dat` altogether, keeping `avel-core.exe` light too.
 
-- **Zero GPU overhead**: pure Win32 GDI never initializes Direct3D/OpenGL or wakes a laptop discrete GPU.
-- **Low core RAM**: Global and process-only modes use explicit LAN CIDRs so `geoip.dat` / `geosite.dat` are not loaded into RAM unless routing rules need them (paired with a `Low RAM` Go GC profile).
-- **No permanent background daemon**: `avel-core.exe` runs inside a Windows Job Object only while connected. Elevated TUN autostart uses a standard Task Scheduler logon entry with no UAC prompt.
-- **No stale browser leaks on connect**: switching to TUN resets pre-existing external TCP sockets on physical adapters, enforces `Metric=0` and `0.0.0.0/0` across Windows PnP/NLA init, and flushes DNS automatically.
-- **Per-app and multi-server routing**: split traffic by `.exe`, folder, domain (`geosite:`), or IP (`geoip:`) to Direct, Block, Active Server, or a specific node from your subscription, with proxy-by-default or whitelist mode.
-- **Hardened and verifiable**: DLL search order locked to `System32`, temporary `runtime_config.json` deleted on disconnect, and release builds compiled directly by GitHub Actions with SHA256-verified official `Xray-core` and `Wintun` binaries.
+There is no 24/7 SYSTEM background service. `avel-core.exe` only runs while connected inside a Windows Job Object, and elevated TUN autostart uses a regular Task Scheduler logon task with no UAC prompt. When TUN starts, the client resets stale pre-VPN browser TCP sockets on Wi-Fi/Ethernet, enforces `Metric=0` and `0.0.0.0/0` across Windows network init, flushes DNS, and supports a WFP Kill-Switch (`allexceptlan`), DoH DNS interception, QUIC (UDP/443) blocking, and automatic reconnect after sleep.
+
+It supports VLESS (Reality, TLS, XHTTP / SplitHTTP, WebSocket, gRPC, HTTPUpgrade, post-quantum ML-KEM-768+X25519), Trojan, and Shadowsocks (including SS-2022) in both System Proxy and Wintun TUN modes. You can split traffic by `.exe`, folder, domain (`geosite:`), or IP (`geoip:`) to Direct, Block, the active server, or another node from your subscription, and adjust TUN MTU, local ports, `Allow LAN`, custom Remote DNS, log level, Go memory profile, and HTTPS Geo database updates from the Settings tab. Release archives are compiled directly by GitHub Actions with SHA256-verified official `Xray-core` and `Wintun` binaries, DLL loading is locked to `System32`, and temporary configs are removed on disconnect.
 
 ## Download
 
 1. Download `avel-xray-<version>-windows-x64.zip` from [Releases](https://github.com/nikolaevichsmor/avel-xray/releases).
-2. Extract to any folder and run `avel.exe` (fully portable, no installer).
+2. Extract to any folder and run `avel.exe` (portable, no installer).
 3. Paste a subscription URL or a `vless://` / `trojan://` / `ss://` link, click **Update**, pick a server, and click **Connect**.
-
-## Features
-
-- **Protocols**: VLESS (Reality, TLS, XHTTP / SplitHTTP, WebSocket, gRPC, HTTPUpgrade, post-quantum ML-KEM-768+X25519), Trojan, and Shadowsocks (including SS-2022).
-- **Modes & protection**: System Proxy (no admin required) or full-device Wintun TUN, IPv4-only leak prevention, built-in DoH DNS interception, optional WFP Kill-Switch (`allexceptlan`), optional QUIC (UDP/443) blocking, and sleep/resume auto-reconnect.
-- **Diagnostics**: direct physical-interface TCP ping (`Ping All`), end-to-end tunnel latency check (`Test 204`), and live NDIS traffic speed/total in the status bar.
-- **Settings tab**: custom TUN MTU (`1280`-`9000`), SOCKS/HTTP ports, `Allow LAN`, custom Remote DNS, Xray log level (`warning` / `info` / `error` / `none`), `domainStrategy`, Go memory profile (`Low RAM` / `Performance`), custom subscription `User-Agent`, launch options, and one-click HTTPS `geoip.dat` / `geosite.dat` updates.
 
 ## Build from source
 
