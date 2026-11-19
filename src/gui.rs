@@ -1,38 +1,48 @@
-use crate::http_win::{fetch_subscription, test_http_proxy_204, update_geo_databases};
+use crate::http_win::{
+    check_latest_release, download_and_verify_release, fetch_subscription, is_newer_version,
+    spawn_live_tunnel_monitor, update_geo_databases, LivePingStats, ReleaseInfo,
+};
 use crate::icon::{create_soft_round_icon, create_watermark_brush};
 use crate::model::{
     app_base_dir, core_dir, custom_routing_path, default_user_agent, ensure_default_custom_routing,
     AppState, DomainStrategy, MemoryProfile, ProxyMode, RoutingPreset, RoutingRule,
-    RuleDefaultAction, RuleMatchKind, VlessNode, XrayLogLevel,
+    RuleDefaultAction, RuleMatchKind, StabilityStats, VlessNode, XrayLogLevel,
 };
-use crate::ping::{extract_ping_targets, ping_all_async};
+use crate::ping::{extract_ping_targets, ping_all_async, stability_test_all_async};
 use crate::sys_proxy::{
     browse_for_exe, disable_system_proxy, enable_system_proxy, enforce_tun_route_and_metric,
     find_adapter_luid, flush_dns_cache, is_autostart_enabled, is_elevated,
     list_running_user_processes, notify_network_change, open_file_in_notepad,
     open_folder_in_explorer, query_luid_octets, relaunch_as_admin, reset_external_tcp_connections,
-    set_autostart, spawn_tun_post_pnp_guard, to_wide,
+    set_autostart, spawn_self_update_helper, spawn_tun_post_pnp_guard, to_wide,
 };
 use crate::vless::parse_subscription_body;
 use crate::xray_config::{build_xray_config, validate_remote_dns};
 use crate::xray_proc::{XrayRunner, XrayStartOpts};
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT,
     WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, FillRect, GetSysColor, GetViewportOrgEx, MapWindowPoints,
-    SetBkMode, SetBrushOrgEx, COLOR_BTNFACE, HBRUSH, HDC, HFONT, TRANSPARENT,
+    CreateFontW, DeleteObject, DrawFocusRect, DrawTextW, FillRect, GetSysColor, GetSysColorBrush,
+    GetViewportOrgEx, InvalidateRect, MapWindowPoints, SelectObject, SetBkMode, SetBrushOrgEx,
+    SetTextColor, COLOR_BTNFACE, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
+    COLOR_WINDOWTEXT, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC,
+    HFONT, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR,
-    TCIF_TEXT, TCITEMW, TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL, TCN_SELCHANGE,
+    InitCommonControlsEx, DRAWITEMSTRUCT, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES,
+    INITCOMMONCONTROLSEX, MEASUREITEMSTRUCT, NMHDR, ODS_FOCUS, ODS_SELECTED, TCIF_TEXT, TCITEMW,
+    TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL, TCN_SELCHANGE,
 };
 use windows_sys::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -44,31 +54,38 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, ChangeWindowMessageFilterEx, CheckMenuItem, CreatePopupMenu, CreateWindowExW,
-    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW,
-    GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect,
+    AppendMenuW, CallWindowProcW, ChangeWindowMessageFilterEx, CheckMenuItem, CreatePopupMenu,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
+    FindWindowW, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, KillTimer, LoadCursorW, MessageBoxW, PostMessageW,
     PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SendMessageW, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu,
     TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_GROUPBOX,
     BS_PUSHBUTTON, CBS_AUTOHSCROLL, CBS_DROPDOWN, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
     CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-    ES_NUMBER, ES_READONLY, GWLP_USERDATA, HICON, HMENU, IDC_ARROW, LBN_DBLCLK, LBN_SELCHANGE,
-    LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, LB_ADDSTRING, LB_DELETESTRING, LB_GETCURSEL, LB_INSERTSTRING,
-    LB_RESETCONTENT, LB_SETCURSEL, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MF_BYCOMMAND,
-    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MSGFLT_ALLOW, PBT_APMRESUMEAUTOMATIC,
-    PBT_APMSUSPEND, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONDBLCLK,
-    WM_LBUTTONUP, WM_NOTIFY, WM_POWERBROADCAST, WM_PRINTCLIENT, WM_RBUTTONUP, WM_SETFONT,
-    WM_SETICON, WM_TIMER, WNDCLASSEXW, WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE,
-    WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    ES_NUMBER, ES_READONLY, GWLP_USERDATA, GWLP_WNDPROC, HICON, HMENU, IDC_ARROW, IDYES,
+    LBN_DBLCLK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
+    LBS_OWNERDRAWFIXED, LB_ADDSTRING, LB_DELETESTRING, LB_GETCURSEL, LB_INSERTSTRING,
+    LB_ITEMFROMPOINT, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MF_BYCOMMAND, MF_CHECKED, MF_SEPARATOR,
+    MF_STRING, MF_UNCHECKED, MSG, MSGFLT_ALLOW, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_NOTIFY, WM_POWERBROADCAST, WM_PRINTCLIENT,
+    WM_RBUTTONUP, WM_SETFONT, WM_SETICON, WM_TIMER, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CAPTION,
+    WS_CHILD, WS_EX_CLIENTEDGE, WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
+
+static ORIG_LISTBOX_PROC: AtomicUsize = AtomicUsize::new(0);
 
 const WINDOW_CLASS: &str = "AvelMainClass";
 const WINDOW_TITLE: &str = "avel-xray";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const MUTEX_NAME: &str = "Local\\Avel_SingleInstance_Mutex";
 
+const SS_RIGHT: u32 = 0x0000_0002;
 const SS_CENTERIMAGE: u32 = 0x0000_0200;
 const SS_SUNKEN: u32 = 0x0000_1000;
 
@@ -99,7 +116,7 @@ const ID_BTN_ELEVATE: usize = 1016;
 const ID_LBL_STATUS: usize = 1017;
 const ID_EDIT_LOG: usize = 1018;
 const ID_BTN_CLEAR_LOG: usize = 1019;
-const ID_BTN_TEST: usize = 1021;
+const ID_BTN_STABILITY: usize = 1021;
 const ID_CHK_KILLSWITCH: usize = 1022;
 const ID_BTN_OPEN_ROUTING: usize = 1023;
 
@@ -138,6 +155,9 @@ const ID_BTN_OPEN_FOLDER: usize = 1214;
 const ID_LBL_GEO_INFO: usize = 1215;
 const ID_BTN_SETTINGS_RESET: usize = 1216;
 const ID_BTN_SETTINGS_APPLY: usize = 1217;
+const ID_BTN_CHECK_UPDATE: usize = 1218;
+const ID_LBL_UPDATE_INFO: usize = 1219;
+const ID_LBL_VERSION: usize = 1220;
 
 // Tray menu IDs
 const ID_TRAY_SHOW: usize = 2001;
@@ -151,8 +171,12 @@ enum UiEvent {
     SubFetched(Result<Vec<VlessNode>, String>),
     PingResult(usize, u32),
     PingFinished,
-    TunnelTestDone(Result<u32, String>),
+    StabilityResult(u32, usize, StabilityStats),
+    StabilityFinished(u32),
+    LivePingUpdate(u32, LivePingStats),
     GeoUpdated(Result<(usize, usize), String>),
+    UpdateChecked(Result<ReleaseInfo, String>),
+    UpdateDownloaded(Result<PathBuf, String>),
     XrayExited(u32),
 }
 
@@ -172,6 +196,12 @@ struct AppContext {
     tun_luid: Option<u64>,
     stats_base: Option<(u64, u64)>,
     stats_prev: Option<(u64, u64)>,
+    last_traffic: Option<String>,
+    live_ping: Option<LivePingStats>,
+    live_ping_stop: Option<Arc<AtomicBool>>,
+    live_ping_gen: u32,
+    stability_cancel: Option<Arc<AtomicBool>>,
+    stability_gen: u32,
 
     // Top tab strip & per-tab visibility groups
     h_tab: HWND,
@@ -184,7 +214,7 @@ struct AppContext {
     h_btn_fetch: HWND,
     h_list_nodes: HWND,
     h_btn_ping: HWND,
-    h_btn_test: HWND,
+    h_btn_stability: HWND,
     h_lbl_count: HWND,
     h_btn_toggle: HWND,
     h_radio_proxy: HWND,
@@ -220,13 +250,17 @@ struct AppContext {
     h_chk_start_min: HWND,
     h_btn_update_geo: HWND,
     h_lbl_geo_info: HWND,
+    h_btn_check_update: HWND,
+    h_lbl_update_info: HWND,
 
-    // Shared bottom status bar
+    // Shared bottom status bar & version label
     h_lbl_status: HWND,
+    h_lbl_version: HWND,
 
     // GDI & tray resources
     font_ui: HFONT,
     font_mono: HFONT,
+    font_mono_bold: HFONT,
     icon_small: HICON,
     icon_big: HICON,
     hbr_bg: HBRUSH,
@@ -358,8 +392,9 @@ pub fn run_app(start_minimized: bool, autoconnect: bool) {
         // Scale 9pt Segoe UI and 8.5pt Consolas to monitor DPI
         let ui_font_h = -((9 * dpi + 36) / 72);
         let mono_font_h = -((85 * dpi + 360) / 720);
-        let font_ui = create_font("Segoe UI", ui_font_h);
-        let font_mono = create_font("Consolas", mono_font_h);
+        let font_ui = create_font("Segoe UI", ui_font_h, 400);
+        let font_mono = create_font("Consolas", mono_font_h, 400);
+        let font_mono_bold = create_font("Consolas", mono_font_h, 700);
 
         let (ev_tx, ev_rx) = mpsc::channel();
         let mut state = AppState::load();
@@ -388,6 +423,12 @@ pub fn run_app(start_minimized: bool, autoconnect: bool) {
             tun_luid: None,
             stats_base: None,
             stats_prev: None,
+            last_traffic: None,
+            live_ping: None,
+            live_ping_stop: None,
+            live_ping_gen: 0,
+            stability_cancel: None,
+            stability_gen: 0,
             h_tab: null_mut(),
             tab0_ctrls: Vec::new(),
             tab1_ctrls: Vec::new(),
@@ -396,7 +437,7 @@ pub fn run_app(start_minimized: bool, autoconnect: bool) {
             h_btn_fetch: null_mut(),
             h_list_nodes: null_mut(),
             h_btn_ping: null_mut(),
-            h_btn_test: null_mut(),
+            h_btn_stability: null_mut(),
             h_lbl_count: null_mut(),
             h_btn_toggle: null_mut(),
             h_radio_proxy: null_mut(),
@@ -428,9 +469,13 @@ pub fn run_app(start_minimized: bool, autoconnect: bool) {
             h_chk_start_min: null_mut(),
             h_btn_update_geo: null_mut(),
             h_lbl_geo_info: null_mut(),
+            h_btn_check_update: null_mut(),
+            h_lbl_update_info: null_mut(),
             h_lbl_status: null_mut(),
+            h_lbl_version: null_mut(),
             font_ui,
             font_mono,
+            font_mono_bold,
             icon_small,
             icon_big,
             hbr_bg,
@@ -531,7 +576,15 @@ impl AppContext {
             h_inst,
             "LISTBOX",
             "",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_NOTIFY as u32 | LBS_NOINTEGRALHEIGHT as u32,
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | WS_VSCROLL
+                | WS_BORDER
+                | LBS_NOTIFY as u32
+                | LBS_NOINTEGRALHEIGHT as u32
+                | LBS_OWNERDRAWFIXED as u32
+                | LBS_HASSTRINGS as u32,
             WS_EX_CLIENTEDGE,
             s(22),
             s(114),
@@ -540,8 +593,10 @@ impl AppContext {
             ID_LIST_NODES,
             fm,
         ));
+        SendMessageW(self.h_list_nodes, LB_SETITEMHEIGHT, 0, s(18) as LPARAM);
+        subclass_listbox_empty_deselect(self.h_list_nodes);
         self.h_btn_ping = t0(mk_ctrl(p, h_inst, "BUTTON", "Ping All", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(22), s(256), s(96), s(24), ID_BTN_PING, f));
-        self.h_btn_test = t0(mk_ctrl(p, h_inst, "BUTTON", "Test 204", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(126), s(256), s(96), s(24), ID_BTN_TEST, f));
+        self.h_btn_stability = t0(mk_ctrl(p, h_inst, "BUTTON", "Stability", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(126), s(256), s(96), s(24), ID_BTN_STABILITY, f));
         t0(mk_ctrl(p, h_inst, "BUTTON", "Remove", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(230), s(256), s(88), s(24), ID_BTN_DEL, f));
         self.h_lbl_count = t0(mk_ctrl(p, h_inst, "STATIC", "Servers: 0", WS_CHILD | WS_VISIBLE, 0, s(330), s(260), s(248), s(18), ID_LBL_COUNT, f));
 
@@ -636,6 +691,7 @@ impl AppContext {
             ID_LIST_RULES,
             fm,
         ));
+        subclass_listbox_empty_deselect(self.h_list_rules);
         t1(mk_ctrl(p, h_inst, "BUTTON", "On / Off", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(22), s(312), s(74), s(24), ID_BTN_RULE_TOGGLE, f));
         t1(mk_ctrl(p, h_inst, "BUTTON", "Up", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(102), s(312), s(52), s(24), ID_BTN_RULE_UP, f));
         t1(mk_ctrl(p, h_inst, "BUTTON", "Down", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(160), s(312), s(56), s(24), ID_BTN_RULE_DOWN, f));
@@ -755,17 +811,20 @@ impl AppContext {
         self.h_chk_autoconnect = t2(mk_ctrl(p, h_inst, "BUTTON", "Auto-connect on launch", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(22), s(370), s(196), s(20), ID_CHK_AUTOCONNECT, f));
         self.h_chk_start_min = t2(mk_ctrl(p, h_inst, "BUTTON", "Start minimized to tray", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(230), s(370), s(200), s(20), ID_CHK_START_MIN, f));
 
-        self.h_btn_update_geo = t2(mk_ctrl(p, h_inst, "BUTTON", "Update GeoIP / GeoSite", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(22), s(402), s(176), s(26), ID_BTN_UPDATE_GEO, f));
-        t2(mk_ctrl(p, h_inst, "BUTTON", "Open Folder", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(208), s(402), s(112), s(26), ID_BTN_OPEN_FOLDER, f));
-        self.h_lbl_geo_info = t2(mk_ctrl(p, h_inst, "STATIC", "", WS_CHILD, 0, s(330), s(406), s(248), s(18), ID_LBL_GEO_INFO, f));
-        t2(mk_ctrl(p, h_inst, "STATIC", "Geo databases are fetched from XTLS/Xray-rules-dat over HTTPS.", WS_CHILD, 0, s(22), s(442), s(556), s(18), 0, f));
+        self.h_btn_update_geo = t2(mk_ctrl(p, h_inst, "BUTTON", "Update GeoIP / GeoSite", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(22), s(402), s(172), s(26), ID_BTN_UPDATE_GEO, f));
+        self.h_lbl_geo_info = t2(mk_ctrl(p, h_inst, "STATIC", "", WS_CHILD, 0, s(206), s(406), s(370), s(18), ID_LBL_GEO_INFO, f));
+
+        self.h_btn_check_update = t2(mk_ctrl(p, h_inst, "BUTTON", "Check Updates", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(22), s(438), s(132), s(26), ID_BTN_CHECK_UPDATE, f));
+        t2(mk_ctrl(p, h_inst, "BUTTON", "Open Folder", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(164), s(438), s(112), s(26), ID_BTN_OPEN_FOLDER, f));
+        self.h_lbl_update_info = t2(mk_ctrl(p, h_inst, "STATIC", &format!("Version: v{}", APP_VERSION), WS_CHILD, 0, s(288), s(442), s(290), s(18), ID_LBL_UPDATE_INFO, f));
 
         // Bottom settings action buttons
         t2(mk_ctrl(p, h_inst, "BUTTON", "Reset Defaults", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(12), s(492), s(124), s(28), ID_BTN_SETTINGS_RESET, f));
         t2(mk_ctrl(p, h_inst, "BUTTON", "Apply && Reconnect", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(420), s(492), s(168), s(28), ID_BTN_SETTINGS_APPLY, f));
 
-        // Bottom status bar
-        self.h_lbl_status = mk_ctrl(p, h_inst, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_SUNKEN | SS_CENTERIMAGE, 0, s(12), s(536), s(576), s(22), ID_LBL_STATUS, f);
+        // Bottom status bar & muted gray version label (shared across all tabs)
+        self.h_lbl_status = mk_ctrl(p, h_inst, "STATIC", "", WS_CHILD | WS_VISIBLE | SS_SUNKEN | SS_CENTERIMAGE, 0, s(12), s(536), s(516), s(22), ID_LBL_STATUS, f);
+        self.h_lbl_version = mk_ctrl(p, h_inst, "STATIC", &format!("v{}", APP_VERSION), WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_CENTERIMAGE, 0, s(532), s(536), s(56), s(22), ID_LBL_VERSION, f);
     }
 
     unsafe fn switch_tab(&mut self, tab_idx: usize) {
@@ -1200,6 +1259,45 @@ impl AppContext {
         });
     }
 
+    unsafe fn on_check_updates(&mut self) {
+        EnableWindow(self.h_btn_check_update, 0);
+        set_text(self.h_btn_check_update, "Checking...");
+        set_text(self.h_lbl_update_info, "Checking GitHub releases...");
+        self.append_log("Checking GitHub for updates...");
+
+        let ua = self.state.user_agent.clone();
+        let tx = self.ev_tx.clone();
+        let hwnd_raw = self.hwnd as usize;
+        std::thread::spawn(move || {
+            let res = check_latest_release(&ua);
+            let _ = tx.send(UiEvent::UpdateChecked(res));
+            PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+        });
+    }
+
+    unsafe fn start_update_download(&mut self, rel: ReleaseInfo) {
+        EnableWindow(self.h_btn_check_update, 0);
+        set_text(self.h_btn_check_update, "Updating...");
+        set_text(
+            self.h_lbl_update_info,
+            &format!("Downloading {}...", rel.tag),
+        );
+        self.append_log(&format!(
+            "Downloading {} and verifying SHA256...",
+            rel.zip_name
+        ));
+
+        let dest_zip = app_base_dir().join("_update").join("release.zip");
+        let ua = self.state.user_agent.clone();
+        let tx = self.ev_tx.clone();
+        let hwnd_raw = self.hwnd as usize;
+        std::thread::spawn(move || {
+            let res = download_and_verify_release(&rel, &dest_zip, &ua).map(|()| dest_zip);
+            let _ = tx.send(UiEvent::UpdateDownloaded(res));
+            PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+        });
+    }
+
     unsafe fn sync_ui_from_state(&mut self) {
         set_text(self.h_edit_sub, &self.state.subscription_url);
 
@@ -1295,14 +1393,22 @@ impl AppContext {
         }
     }
 
-    unsafe fn update_status_with_traffic(&mut self, traffic_suffix: Option<&str>) {
+    unsafe fn update_status_and_tray(&mut self) {
         let status_str = if self.connected {
-            if let Some(stats) = traffic_suffix {
-                format!(" Connected - {}", stats)
+            let ping_part = match self.live_ping {
+                Some(lp) => lp.format_status(),
+                None => "ping...".to_string(),
+            };
+            if self.state.mode == ProxyMode::Tun {
+                if let Some(ref tr) = self.last_traffic {
+                    format!(" Connected - {} - {}", ping_part, tr)
+                } else {
+                    format!(" Connected - {}", ping_part)
+                }
             } else {
                 format!(
-                    " Connected - SOCKS {} / HTTP {}",
-                    self.state.socks_port, self.state.http_port
+                    " Connected - {} - SOCKS {} / HTTP {}",
+                    ping_part, self.state.socks_port, self.state.http_port
                 )
             }
         } else {
@@ -1317,10 +1423,6 @@ impl AppContext {
             if self.connected { "Disconnect" } else { "Connect" },
         );
         self.modify_tray_tip(&format!("avel-xray - {}", status_str.trim()));
-    }
-
-    unsafe fn update_status_and_tray(&mut self) {
-        self.update_status_with_traffic(None);
     }
 
     unsafe fn on_stats_tick(&mut self) {
@@ -1341,13 +1443,38 @@ impl AppContext {
         let drx = rx.saturating_sub(prev_rx);
         let dtx = tx.saturating_sub(prev_tx);
         let total = rx.saturating_sub(base_rx).saturating_add(tx.saturating_sub(base_tx));
-        let summary = format!(
+        self.last_traffic = Some(format!(
             "Dn {}, Up {} ({})",
             fmt_rate(drx),
             fmt_rate(dtx),
             fmt_bytes(total)
-        );
-        self.update_status_with_traffic(Some(&summary));
+        ));
+        self.update_status_and_tray();
+    }
+
+    fn stop_live_monitor(&mut self) {
+        if let Some(flag) = self.live_ping_stop.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.live_ping_gen = self.live_ping_gen.wrapping_add(1);
+        self.live_ping = None;
+        self.last_traffic = None;
+    }
+
+    fn start_live_monitor(&mut self) {
+        self.stop_live_monitor();
+        let gen = self.live_ping_gen;
+        let stop = Arc::new(AtomicBool::new(false));
+        self.live_ping_stop = Some(stop.clone());
+        let port = self.state.http_port;
+        let tx = self.ev_tx.clone();
+        let hwnd_raw = self.hwnd as usize;
+        spawn_live_tunnel_monitor(port, stop, move |stats| {
+            let _ = tx.send(UiEvent::LivePingUpdate(gen, stats));
+            unsafe {
+                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+            }
+        });
     }
 
     unsafe fn add_tray_icon(&mut self) {
@@ -1474,13 +1601,14 @@ impl AppContext {
     }
 
     unsafe fn on_ping_all(&mut self) {
-        if self.state.nodes.is_empty() {
+        if self.state.nodes.is_empty() || self.stability_cancel.is_some() {
             return;
         }
         if self.connected && self.state.mode == ProxyMode::Tun && self.state.kill_switch {
-            self.append_log("Note: Kill-Switch (allexceptlan) blocks direct Wi-Fi TCP ping; use Test 204 or disconnect first.");
+            self.append_log("Note: Kill-Switch (allexceptlan) blocks direct Wi-Fi TCP ping; disconnect first.");
         }
         EnableWindow(self.h_btn_ping, 0);
+        EnableWindow(self.h_btn_stability, 0);
         set_text(self.h_btn_ping, "Pinging...");
         self.append_log("Running TCP ping on all servers...");
         let targets = extract_ping_targets(&self.state.nodes);
@@ -1500,21 +1628,50 @@ impl AppContext {
         );
     }
 
-    unsafe fn on_test_tunnel(&mut self) {
-        if !self.connected {
-            self.append_log("Connect to a server first to run Test 204.");
+    unsafe fn on_stability_toggle(&mut self) {
+        if let Some(ref flag) = self.stability_cancel {
+            flag.store(true, Ordering::Relaxed);
+            EnableWindow(self.h_btn_stability, 0);
+            set_text(self.h_btn_stability, "Stopping...");
             return;
         }
-        EnableWindow(self.h_btn_test, 0);
-        set_text(self.h_btn_test, "Testing...");
-        let port = self.state.http_port;
-        let tx = self.ev_tx.clone();
+        if self.state.nodes.is_empty() {
+            return;
+        }
+        if self.connected && self.state.mode == ProxyMode::Tun && self.state.kill_switch {
+            self.append_log("Note: Kill-Switch (allexceptlan) blocks direct Wi-Fi TCP probes; disconnect first.");
+        }
+        for n in &mut self.state.nodes {
+            n.stability = None;
+        }
+        self.rebuild_node_list();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.stability_cancel = Some(cancel.clone());
+        self.stability_gen = self.stability_gen.wrapping_add(1);
+        let gen = self.stability_gen;
+        EnableWindow(self.h_btn_ping, 0);
+        set_text(self.h_btn_stability, "Stop");
+        self.append_log("Running 10-probe stability test (~5s)...");
+
+        let targets = extract_ping_targets(&self.state.nodes);
+        let tx1 = self.ev_tx.clone();
+        let tx2 = self.ev_tx.clone();
         let hwnd_raw = self.hwnd as usize;
-        std::thread::spawn(move || {
-            let res = test_http_proxy_204(port);
-            let _ = tx.send(UiEvent::TunnelTestDone(res));
-            PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
-        });
+        stability_test_all_async(
+            targets,
+            10,
+            500,
+            cancel,
+            move |idx, stats| {
+                let _ = tx1.send(UiEvent::StabilityResult(gen, idx, stats));
+                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+            },
+            move || {
+                let _ = tx2.send(UiEvent::StabilityFinished(gen));
+                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+            },
+        );
     }
 
     // Automatically prompts Windows UAC and relaunches elevated; rolls back if UAC is cancelled
@@ -1668,6 +1825,8 @@ impl AppContext {
                 }
                 self.connected = true;
                 self.connected_node_key = Some((node.uuid.clone(), node.address.clone(), node.port));
+                InvalidateRect(self.h_list_nodes, null(), 1);
+                self.start_live_monitor();
                 let _ = self.state.save();
                 // Drain core startup stdout lines first so our Connected summary stays visible at bottom
                 self.drain_ui_events();
@@ -1704,6 +1863,7 @@ impl AppContext {
 
     unsafe fn disconnect(&mut self) {
         KillTimer(self.hwnd, TIMER_STATS);
+        self.stop_live_monitor();
         self.tun_luid = None;
         self.stats_base = None;
         self.stats_prev = None;
@@ -1713,6 +1873,7 @@ impl AppContext {
         if self.connected {
             self.connected = false;
             self.connected_node_key = None;
+            InvalidateRect(self.h_list_nodes, null(), 1);
             self.append_log("Disconnected. System Proxy disabled.");
         }
         self.update_status_and_tray();
@@ -1748,6 +1909,13 @@ impl AppContext {
                                         .position(|n| n.uuid == u && n.address == a && n.port == p)
                                 })
                                 .unwrap_or(0);
+                            if let Some(flag) = self.stability_cancel.take() {
+                                flag.store(true, Ordering::Relaxed);
+                                self.stability_gen = self.stability_gen.wrapping_add(1);
+                                EnableWindow(self.h_btn_ping, 1);
+                                EnableWindow(self.h_btn_stability, 1);
+                                set_text(self.h_btn_stability, "Stability");
+                            }
                             self.state.nodes = nodes;
                             self.state.selected_index = preserved_idx;
                             let _ = self.state.save();
@@ -1768,15 +1936,32 @@ impl AppContext {
                 }
                 UiEvent::PingFinished => {
                     EnableWindow(self.h_btn_ping, 1);
+                    EnableWindow(self.h_btn_stability, 1);
                     set_text(self.h_btn_ping, "Ping All");
                     self.append_log("TCP ping finished.");
                 }
-                UiEvent::TunnelTestDone(res) => {
-                    EnableWindow(self.h_btn_test, 1);
-                    set_text(self.h_btn_test, "Test 204");
-                    match res {
-                        Ok(ms) => self.append_log(&format!("Tunnel OK: HTTPS 204 in {} ms.", ms)),
-                        Err(e) => self.append_log(&format!("Tunnel test failed: {}", e)),
+                UiEvent::StabilityResult(gen, idx, stats) => {
+                    if gen == self.stability_gen {
+                        if let Some(n) = self.state.nodes.get_mut(idx) {
+                            n.stability = Some(stats);
+                            n.ping_ms = Some(stats.avg_ms);
+                        }
+                        self.update_single_node_row(idx);
+                    }
+                }
+                UiEvent::StabilityFinished(gen) => {
+                    if gen == self.stability_gen {
+                        self.stability_cancel = None;
+                        EnableWindow(self.h_btn_ping, 1);
+                        EnableWindow(self.h_btn_stability, 1);
+                        set_text(self.h_btn_stability, "Stability");
+                        self.append_log("Stability test finished.");
+                    }
+                }
+                UiEvent::LivePingUpdate(gen, stats) => {
+                    if self.connected && gen == self.live_ping_gen {
+                        self.live_ping = Some(stats);
+                        self.update_status_and_tray();
                     }
                 }
                 UiEvent::GeoUpdated(res) => {
@@ -1797,9 +1982,87 @@ impl AppContext {
                         }
                     }
                 }
+                UiEvent::UpdateChecked(res) => {
+                    EnableWindow(self.h_btn_check_update, 1);
+                    set_text(self.h_btn_check_update, "Check Updates");
+                    match res {
+                        Ok(rel) => {
+                            if is_newer_version(APP_VERSION, &rel.tag) {
+                                set_text(
+                                    self.h_lbl_update_info,
+                                    &format!("Available: {}", rel.tag),
+                                );
+                                self.append_log(&format!(
+                                    "Update available: {} (current v{}).",
+                                    rel.tag, APP_VERSION
+                                ));
+                                let prompt = format!(
+                                    "New version {} is available (current: v{}).\n\nDownload, verify SHA256, and restart now?",
+                                    rel.tag, APP_VERSION
+                                );
+                                if msg_box(
+                                    self.hwnd,
+                                    &prompt,
+                                    "Update Available",
+                                    MB_YESNO | MB_ICONQUESTION,
+                                ) == IDYES
+                                {
+                                    self.start_update_download(rel);
+                                }
+                            } else {
+                                set_text(
+                                    self.h_lbl_update_info,
+                                    &format!("Up to date (v{})", APP_VERSION),
+                                );
+                                self.append_log(&format!(
+                                    "Already on latest version (v{}, GitHub latest: {}).",
+                                    APP_VERSION, rel.tag
+                                ));
+                                msg_box(
+                                    self.hwnd,
+                                    &format!("You are already using the latest version (v{}).", APP_VERSION),
+                                    "Check Updates",
+                                    MB_OK | MB_ICONINFORMATION,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            set_text(self.h_lbl_update_info, "Update check failed");
+                            self.append_log(&format!("Update check failed: {}", e));
+                            msg_box(self.hwnd, &e, "Update Check Error", MB_OK | MB_ICONERROR);
+                        }
+                    }
+                }
+                UiEvent::UpdateDownloaded(res) => match res {
+                    Ok(zip_path) => {
+                        let was_connected = self.connected;
+                        self.append_log("Update verified (SHA256 OK). Installing and restarting...");
+                        set_text(self.h_lbl_update_info, "Installing & restarting...");
+                        self.disconnect();
+                        let _ = self.state.save();
+                        match spawn_self_update_helper(&zip_path, &app_base_dir(), was_connected) {
+                            Ok(()) => self.full_exit(),
+                            Err(e) => {
+                                EnableWindow(self.h_btn_check_update, 1);
+                                set_text(self.h_btn_check_update, "Check Updates");
+                                set_text(self.h_lbl_update_info, "Install failed");
+                                self.append_log(&format!("Self-update helper failed: {}", e));
+                                msg_box(self.hwnd, &e, "Update Error", MB_OK | MB_ICONERROR);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        EnableWindow(self.h_btn_check_update, 1);
+                        set_text(self.h_btn_check_update, "Check Updates");
+                        set_text(self.h_lbl_update_info, "Download failed");
+                        self.append_log(&format!("Update download failed: {}", e));
+                        msg_box(self.hwnd, &e, "Update Error", MB_OK | MB_ICONERROR);
+                    }
+                },
                 UiEvent::XrayExited(exited_pid) => {
                     if self.connected && self.runner.active_pid() == Some(exited_pid) {
                         KillTimer(self.hwnd, TIMER_STATS);
+                        self.stop_live_monitor();
                         self.tun_luid = None;
                         self.stats_base = None;
                         self.stats_prev = None;
@@ -1808,6 +2071,7 @@ impl AppContext {
                         flush_dns_cache();
                         self.connected = false;
                         self.connected_node_key = None;
+                        InvalidateRect(self.h_list_nodes, null(), 1);
                         self.append_log("WARNING: avel-core.exe exited unexpectedly. Disconnected.");
                         self.update_status_and_tray();
                     }
@@ -1873,6 +2137,9 @@ impl AppContext {
 
     unsafe fn full_exit(&mut self) {
         self.exiting = true;
+        if let Some(flag) = self.stability_cancel.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
         self.disconnect();
         let _ = self.state.save();
         self.remove_tray_icon();
@@ -1888,6 +2155,9 @@ impl AppContext {
         }
         if !self.font_mono.is_null() {
             DeleteObject(self.font_mono as _);
+        }
+        if !self.font_mono_bold.is_null() {
+            DeleteObject(self.font_mono_bold as _);
         }
         if !self.icon_small.is_null() {
             DestroyIcon(self.icon_small);
@@ -1915,6 +2185,133 @@ impl AppContext {
         };
         FillRect(hdc, &rc, self.hbr_bg);
         true
+    }
+
+    unsafe fn draw_node_list_item(&self, dis: &DRAWITEMSTRUCT) {
+        if dis.itemID == u32::MAX {
+            return;
+        }
+        let idx = dis.itemID as usize;
+        let Some(node) = self.state.nodes.get(idx) else {
+            return;
+        };
+
+        let hdc = dis.hDC;
+        let selected = (dis.itemState & ODS_SELECTED) != 0;
+        let bg_brush = GetSysColorBrush(if selected {
+            COLOR_HIGHLIGHT
+        } else {
+            COLOR_WINDOW
+        });
+        FillRect(hdc, &dis.rcItem, bg_brush);
+
+        let fg_color = GetSysColor(if selected {
+            COLOR_HIGHLIGHTTEXT
+        } else {
+            COLOR_WINDOWTEXT
+        });
+        SetTextColor(hdc, fg_color);
+        SetBkMode(hdc, TRANSPARENT as i32);
+
+        let is_active = self.connected
+            && self
+                .connected_node_key
+                .as_ref()
+                .map(|(u, a, p)| u == &node.uuid && a == &node.address && *p == node.port)
+                .unwrap_or(false);
+
+        let pad_x = scale_dpi(4, self.dpi);
+        let mut rc = dis.rcItem;
+        rc.left += pad_x;
+
+        if is_active {
+            let old_font = SelectObject(hdc, self.font_mono_bold as _);
+            let w_name = to_wide(&node.name);
+            let mut calc = rc;
+            DrawTextW(
+                hdc,
+                w_name.as_ptr(),
+                (w_name.len().saturating_sub(1)) as i32,
+                &mut calc,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT,
+            );
+            DrawTextW(
+                hdc,
+                w_name.as_ptr(),
+                (w_name.len().saturating_sub(1)) as i32,
+                &mut rc,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+
+            SelectObject(hdc, self.font_mono as _);
+            let mut rc_rest = dis.rcItem;
+            rc_rest.left = calc.right;
+            let w_rest = to_wide(&node.display_details());
+            DrawTextW(
+                hdc,
+                w_rest.as_ptr(),
+                (w_rest.len().saturating_sub(1)) as i32,
+                &mut rc_rest,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(hdc, old_font);
+        } else {
+            let old_font = SelectObject(hdc, self.font_mono as _);
+            let w_row = to_wide(&node.display_row());
+            DrawTextW(
+                hdc,
+                w_row.as_ptr(),
+                (w_row.len().saturating_sub(1)) as i32,
+                &mut rc,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SelectObject(hdc, old_font);
+        }
+
+        if (dis.itemState & ODS_FOCUS) != 0 {
+            DrawFocusRect(hdc, &dis.rcItem);
+        }
+    }
+}
+
+unsafe fn subclass_listbox_empty_deselect(h_list: HWND) {
+    if h_list.is_null() {
+        return;
+    }
+    let prev = SetWindowLongPtrW(
+        h_list,
+        GWLP_WNDPROC,
+        listbox_deselect_proc as *const () as usize as isize,
+    ) as usize;
+    if prev != 0 {
+        let _ = ORIG_LISTBOX_PROC.compare_exchange(
+            0,
+            prev,
+            Ordering::SeqCst,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+unsafe extern "system" fn listbox_deselect_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_LBUTTONDOWN {
+        let res = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lparam) as u32;
+        if (res >> 16) != 0 {
+            SendMessageW(hwnd, LB_SETCURSEL, usize::MAX, 0);
+            return 0;
+        }
+    }
+    let orig = ORIG_LISTBOX_PROC.load(Ordering::Relaxed);
+    if orig != 0 {
+        let f: WNDPROC = std::mem::transmute(orig);
+        CallWindowProcW(f, hwnd, msg, wparam, lparam)
+    } else {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 }
 
@@ -1955,10 +2352,41 @@ unsafe extern "system" fn wnd_proc(
             if child != ctx.h_edit_log && !ctx.hbr_bg.is_null() {
                 let hdc = wparam as HDC;
                 SetBkMode(hdc, TRANSPARENT as i32);
+                if child == ctx.h_lbl_version {
+                    SetTextColor(hdc, 0x0078_7878);
+                }
                 let mut pt = POINT { x: 0, y: 0 };
                 MapWindowPoints(child, hwnd, &mut pt, 1);
                 SetBrushOrgEx(hdc, -pt.x, -pt.y, null_mut());
                 return ctx.hbr_bg as LRESULT;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_MEASUREITEM => {
+            if lparam != 0 {
+                let mis = &mut *(lparam as *mut MEASUREITEMSTRUCT);
+                if mis.CtlID == ID_LIST_NODES as u32 {
+                    mis.itemHeight = scale_dpi(18, ctx.dpi) as u32;
+                    return 1;
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_DRAWITEM => {
+            if lparam != 0 {
+                let dis = &*(lparam as *const DRAWITEMSTRUCT);
+                if dis.CtlID == ID_LIST_NODES as u32 {
+                    ctx.draw_node_list_item(dis);
+                    return 1;
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_LBUTTONDOWN => {
+            if ctx.active_tab == 0 {
+                SendMessageW(ctx.h_list_nodes, LB_SETCURSEL, usize::MAX, 0);
+            } else if ctx.active_tab == 1 {
+                SendMessageW(ctx.h_list_rules, LB_SETCURSEL, usize::MAX, 0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -2049,10 +2477,17 @@ unsafe extern "system" fn wnd_proc(
             match id {
                 ID_BTN_FETCH => ctx.on_fetch_subscription(),
                 ID_BTN_PING => ctx.on_ping_all(),
-                ID_BTN_TEST => ctx.on_test_tunnel(),
+                ID_BTN_STABILITY => ctx.on_stability_toggle(),
                 ID_BTN_DEL => {
                     let sel = SendMessageW(ctx.h_list_nodes, LB_GETCURSEL, 0, 0);
                     if sel >= 0 && (sel as usize) < ctx.state.nodes.len() {
+                        if let Some(flag) = ctx.stability_cancel.take() {
+                            flag.store(true, Ordering::Relaxed);
+                            ctx.stability_gen = ctx.stability_gen.wrapping_add(1);
+                            EnableWindow(ctx.h_btn_ping, 1);
+                            EnableWindow(ctx.h_btn_stability, 1);
+                            set_text(ctx.h_btn_stability, "Stability");
+                        }
                         ctx.state.nodes.remove(sel as usize);
                         if ctx.state.selected_index >= ctx.state.nodes.len()
                             && !ctx.state.nodes.is_empty()
@@ -2157,6 +2592,7 @@ unsafe extern "system" fn wnd_proc(
                 ID_BTN_SETTINGS_APPLY => ctx.on_apply_settings(),
                 ID_BTN_SETTINGS_RESET => ctx.on_reset_settings(),
                 ID_BTN_UPDATE_GEO => ctx.on_update_geo(),
+                ID_BTN_CHECK_UPDATE => ctx.on_check_updates(),
                 ID_BTN_OPEN_FOLDER => open_folder_in_explorer(&app_base_dir()),
                 ID_BTN_RULE_BROWSE => {
                     if let Some(exe_name) = browse_for_exe(hwnd) {
@@ -2309,10 +2745,10 @@ unsafe fn mk_ctrl(
     hwnd
 }
 
-unsafe fn create_font(face: &str, height: i32) -> HFONT {
+unsafe fn create_font(face: &str, height: i32, weight: i32) -> HFONT {
     let w_face = to_wide(face);
     // Quality 5 = CLEARTYPE_QUALITY
-    CreateFontW(height, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, w_face.as_ptr())
+    CreateFontW(height, 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, w_face.as_ptr())
 }
 
 unsafe fn set_text(hwnd: HWND, text: &str) {
