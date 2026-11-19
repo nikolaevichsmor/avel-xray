@@ -1,0 +1,24 @@
+Third-Party Licenses and Notices
+================================
+
+avel-xray itself is licensed under the GNU General Public License v3.0 (see LICENSE).
+Portable release archives bundle or download the following third-party components:
+
+1. Xray-core (core/avel-core.exe)
+   Source:  https://github.com/XTLS/Xray-core
+   License: Mozilla Public License 2.0 (MPL-2.0)
+   https://github.com/XTLS/Xray-core/blob/main/LICENSE
+
+2. Wintun (core/wintun.dll)
+   Source:  https://www.wintun.net/
+   License: GNU General Public License v2.0 (GPL-2.0)
+   Prebuilt signed driver by WireGuard LLC.
+
+3. Xray-rules-dat (core/geoip.dat, core/geosite.dat)
+   Source:  https://github.com/XTLS/Xray-rules-dat
+   License: CC-BY-SA-4.0 / MIT (see upstream repository)
+
+4. Rust crate dependencies (compiled into avel.exe)
+   - windows-sys (MIT OR Apache-2.0)
+   - serde, serde_json (MIT OR Apache-2.0)
+   - base64 (MIT OR Apache-2.0)
