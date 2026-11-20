@@ -171,6 +171,8 @@ const ID_CHK_FRAGMENT: usize = 1221;
 const ID_CHK_NOISE: usize = 1222;
 const ID_CHK_MUX: usize = 1223;
 const ID_CHK_HWID: usize = 1224;
+const ID_CHK_SNIFFING: usize = 1225;
+const ID_CHK_DEST_OVERRIDE: usize = 1226;
 
 // Tray menu IDs
 const ID_TRAY_SHOW: usize = 2001;
@@ -288,6 +290,8 @@ struct AppContext {
     h_chk_fragment: HWND,
     h_chk_noise: HWND,
     h_chk_mux: HWND,
+    h_chk_sniffing: HWND,
+    h_chk_dest_override: HWND,
     h_edit_ua: HWND,
     h_chk_autoconnect: HWND,
     h_chk_start_min: HWND,
@@ -515,6 +519,8 @@ pub fn run_app(start_minimized: bool, autoconnect: bool) {
             h_chk_fragment: null_mut(),
             h_chk_noise: null_mut(),
             h_chk_mux: null_mut(),
+            h_chk_sniffing: null_mut(),
+            h_chk_dest_override: null_mut(),
             h_edit_ua: null_mut(),
             h_chk_autoconnect: null_mut(),
             h_chk_start_min: null_mut(),
@@ -867,11 +873,13 @@ impl AppContext {
         }
 
         t2(mk_ctrl(p, h_inst, "STATIC", "Memory Profile:", WS_CHILD, 0, s(22), s(251), s(96), s(18), 0, f));
-        self.h_combo_mem = t2(mk_ctrl(p, h_inst, "COMBOBOX", "", WS_CHILD | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32, 0, s(122), s(247), s(218), s(100), ID_COMBO_MEM, f));
+        self.h_combo_mem = t2(mk_ctrl(p, h_inst, "COMBOBOX", "", WS_CHILD | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST as u32, 0, s(122), s(247), s(212), s(100), ID_COMBO_MEM, f));
         for item in ["Low RAM (GOGC=50)", "Performance (GOGC=100)"] {
             let w = to_wide(item);
             SendMessageW(self.h_combo_mem, CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
         }
+        self.h_chk_sniffing = t2(mk_ctrl(p, h_inst, "BUTTON", "Sniffing", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(348), s(249), s(92), s(20), ID_CHK_SNIFFING, f));
+        self.h_chk_dest_override = t2(mk_ctrl(p, h_inst, "BUTTON", "Dest Override", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(446), s(249), s(132), s(20), ID_CHK_DEST_OVERRIDE, f));
         self.h_chk_fragment = t2(mk_ctrl(p, h_inst, "BUTTON", "TLS Fragment", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(22), s(278), s(140), s(20), ID_CHK_FRAGMENT, f));
         self.h_chk_noise = t2(mk_ctrl(p, h_inst, "BUTTON", "UDP Noise", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(176), s(278), s(130), s(20), ID_CHK_NOISE, f));
         self.h_chk_mux = t2(mk_ctrl(p, h_inst, "BUTTON", "Mux (XUDP)", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(320), s(278), s(140), s(20), ID_CHK_MUX, f));
@@ -1185,6 +1193,22 @@ impl AppContext {
             if self.state.enable_mux { 1 } else { 0 },
             0,
         );
+        SendMessageW(
+            self.h_chk_sniffing,
+            BM_SETCHECK,
+            if self.state.enable_sniffing { 1 } else { 0 },
+            0,
+        );
+        SendMessageW(
+            self.h_chk_dest_override,
+            BM_SETCHECK,
+            if self.state.sniffing_dest_override { 1 } else { 0 },
+            0,
+        );
+        EnableWindow(
+            self.h_chk_dest_override,
+            if self.state.enable_sniffing { 1 } else { 0 },
+        );
         set_text(self.h_edit_ua, &self.state.user_agent);
         SendMessageW(
             self.h_chk_autoconnect,
@@ -1273,6 +1297,8 @@ impl AppContext {
         let enable_fragment = SendMessageW(self.h_chk_fragment, BM_GETCHECK, 0, 0) != 0;
         let enable_noise = SendMessageW(self.h_chk_noise, BM_GETCHECK, 0, 0) != 0;
         let enable_mux = SendMessageW(self.h_chk_mux, BM_GETCHECK, 0, 0) != 0;
+        let enable_sniffing = SendMessageW(self.h_chk_sniffing, BM_GETCHECK, 0, 0) != 0;
+        let sniffing_dest_override = SendMessageW(self.h_chk_dest_override, BM_GETCHECK, 0, 0) != 0;
         let ua_raw = get_text(self.h_edit_ua).trim().to_string();
         let user_agent = if ua_raw.is_empty() {
             default_user_agent()
@@ -1295,7 +1321,9 @@ impl AppContext {
             || self.state.memory_profile != memory_profile
             || self.state.enable_fragment != enable_fragment
             || self.state.enable_noise != enable_noise
-            || self.state.enable_mux != enable_mux;
+            || self.state.enable_mux != enable_mux
+            || self.state.enable_sniffing != enable_sniffing
+            || self.state.sniffing_dest_override != sniffing_dest_override;
 
         self.state.tun_mtu = mtu;
         self.state.socks_port = socks_port;
@@ -1309,6 +1337,8 @@ impl AppContext {
         self.state.enable_fragment = enable_fragment;
         self.state.enable_noise = enable_noise;
         self.state.enable_mux = enable_mux;
+        self.state.enable_sniffing = enable_sniffing;
+        self.state.sniffing_dest_override = sniffing_dest_override;
         self.state.user_agent = user_agent;
         self.state.auto_connect_on_launch = auto_connect_on_launch;
         self.state.start_minimized = start_minimized;
@@ -3551,6 +3581,10 @@ unsafe extern "system" fn wnd_proc(
                 ID_BTN_RULE_ADD => ctx.on_add_rule(),
                 ID_BTN_SETTINGS_APPLY => ctx.on_apply_settings(),
                 ID_BTN_SETTINGS_RESET => ctx.on_reset_settings(),
+                ID_CHK_SNIFFING => {
+                    let chk = SendMessageW(ctx.h_chk_sniffing, BM_GETCHECK, 0, 0) != 0;
+                    EnableWindow(ctx.h_chk_dest_override, if chk { 1 } else { 0 });
+                }
                 ID_BTN_UPDATE_GEO => ctx.on_update_geo(),
                 ID_BTN_CHECK_UPDATE => ctx.on_check_updates(),
                 ID_BTN_OPEN_FOLDER => open_folder_in_explorer(&app_base_dir()),

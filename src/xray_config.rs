@@ -114,8 +114,19 @@ pub fn build_xray_config(state: &AppState, node: &VlessNode) -> Result<String, S
     dns_servers.push(json!(remote_dns));
     dns_servers.push(json!(format!("tcp://{}:53", fallback_dns_ip)));
 
-    // Inbounds (routeOnly=false so the remote server resolves sniffed domains)
+    // Inbounds (sniffing and destOverride / routeOnly are configurable in Settings)
     let listen_addr = if state.allow_lan { "0.0.0.0" } else { "127.0.0.1" };
+    let sniffing = if state.enable_sniffing {
+        json!({
+            "enabled": true,
+            "destOverride": ["http", "tls", "quic"],
+            "routeOnly": !state.sniffing_dest_override
+        })
+    } else {
+        json!({
+            "enabled": false
+        })
+    };
     let mut inbounds: Vec<Value> = vec![
         json!({
             "tag": "socks-in",
@@ -123,22 +134,14 @@ pub fn build_xray_config(state: &AppState, node: &VlessNode) -> Result<String, S
             "port": state.socks_port,
             "protocol": "socks",
             "settings": { "udp": true },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"],
-                "routeOnly": false
-            }
+            "sniffing": sniffing.clone()
         }),
         json!({
             "tag": "http-in",
             "listen": listen_addr,
             "port": state.http_port,
             "protocol": "http",
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"],
-                "routeOnly": false
-            }
+            "sniffing": sniffing.clone()
         }),
     ];
 
@@ -165,11 +168,7 @@ pub fn build_xray_config(state: &AppState, node: &VlessNode) -> Result<String, S
                 "autoOutboundsInterface": "auto",
                 "autoSystemWfpBlockLeak": wfp_block
             },
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"],
-                "routeOnly": false
-            }
+            "sniffing": sniffing
         }));
     }
 
@@ -1293,6 +1292,22 @@ mod tests {
         assert!(cfg_dns_ip.contains("\"loglevel\": \"none\""));
         assert!(cfg_dns_ip.contains("\"domainStrategy\": \"IPOnDemand\""));
         run_xray_test(&core, "settings_custom_dns_ip", &cfg_dns_ip);
+
+        let mut st_sniff_route = st_set.clone();
+        st_sniff_route.enable_sniffing = true;
+        st_sniff_route.sniffing_dest_override = false;
+        let cfg_sniff_route = build_xray_config(&st_sniff_route, &n1).unwrap();
+        assert!(cfg_sniff_route.contains("\"routeOnly\": true"));
+        assert!(cfg_sniff_route.contains("\"destOverride\""));
+        run_xray_test(&core, "sniffing_route_only", &cfg_sniff_route);
+
+        let mut st_sniff_off = st_set.clone();
+        st_sniff_off.enable_sniffing = false;
+        st_sniff_off.sniffing_dest_override = false;
+        let cfg_sniff_off = build_xray_config(&st_sniff_off, &n1).unwrap();
+        assert!(cfg_sniff_off.contains("\"enabled\": false"));
+        assert!(!cfg_sniff_off.contains("\"destOverride\""));
+        run_xray_test(&core, "sniffing_disabled", &cfg_sniff_off);
     }
 
     #[test]

@@ -568,6 +568,10 @@ pub struct AppState {
     pub send_hwid: bool,
     #[serde(default)]
     pub last_update_check_unix: u64,
+    #[serde(default = "default_true")]
+    pub enable_sniffing: bool,
+    #[serde(default = "default_true")]
+    pub sniffing_dest_override: bool,
 }
 
 fn default_true() -> bool {
@@ -620,6 +624,8 @@ impl Default for AppState {
             enable_mux: false,
             send_hwid: false,
             last_update_check_unix: 0,
+            enable_sniffing: true,
+            sniffing_dest_override: true,
         }
     }
 }
@@ -764,6 +770,8 @@ impl AppState {
         self.enable_noise = false;
         self.enable_mux = false;
         self.send_hwid = false;
+        self.enable_sniffing = true;
+        self.sniffing_dest_override = true;
     }
 
     pub fn save(&self) -> Result<(), String> {
