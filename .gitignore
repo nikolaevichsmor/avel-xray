@@ -5,5 +5,9 @@
 state.json
 routing_custom.txt
 core/runtime_config.json
+core/realping_*.json
 core/_ut_*.json
 core/_test_*.json
+.env
+*.jks
+*.keystore
