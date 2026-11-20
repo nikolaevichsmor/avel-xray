@@ -174,8 +174,13 @@ pub fn build_xray_config(state: &AppState, node: &VlessNode) -> Result<String, S
     }
 
     // 3. Outbounds: active server ("proxy"), any extra per-rule servers ("node-N"), direct, block, dns-out
+    let out_opts = OutboundOpts {
+        fragment: state.enable_fragment,
+        noise: state.enable_noise,
+        mux: state.enable_mux,
+    };
     let mut outbounds_vec: Vec<Value> = Vec::new();
-    outbounds_vec.push(build_node_outbound("proxy", node)?);
+    outbounds_vec.push(build_node_outbound("proxy", node, out_opts)?);
 
     let mut extra_sorted: Vec<(usize, String)> = extra_node_tags
         .iter()
@@ -184,7 +189,7 @@ pub fn build_xray_config(state: &AppState, node: &VlessNode) -> Result<String, S
     extra_sorted.sort_by_key(|(idx, _)| *idx);
     for (idx, tag) in &extra_sorted {
         if let Some(extra_node) = state.nodes.get(*idx) {
-            outbounds_vec.push(build_node_outbound(tag, extra_node)?);
+            outbounds_vec.push(build_node_outbound(tag, extra_node, out_opts)?);
         }
     }
 
@@ -381,6 +386,75 @@ pub fn build_xray_config(state: &AppState, node: &VlessNode) -> Result<String, S
     serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutboundOpts {
+    pub fragment: bool,
+    pub noise: bool,
+    pub mux: bool,
+}
+
+// Build a minimal multi-inbound Xray config for batch Real Delay (HTTP /generate_204) probing.
+pub fn build_batch_test_config(
+    batch: &[(usize, VlessNode, u16)],
+    bind_interface: Option<&str>,
+    opts: OutboundOpts,
+) -> Result<(String, Vec<(usize, u16)>), String> {
+    let mut inbounds: Vec<Value> = Vec::with_capacity(batch.len());
+    let mut outbounds: Vec<Value> = Vec::with_capacity(batch.len());
+    let mut rules: Vec<Value> = Vec::with_capacity(batch.len());
+    let mut valid: Vec<(usize, u16)> = Vec::with_capacity(batch.len());
+
+    for (slot, (node_idx, node, port)) in batch.iter().enumerate() {
+        let out_tag = format!("out-{}", slot);
+        let Ok(mut out) = build_node_outbound(&out_tag, node, opts) else {
+            continue;
+        };
+        if let Some(iface) = bind_interface.filter(|s| !s.is_empty()) {
+            if let Some(sockopt) = out
+                .get_mut("streamSettings")
+                .and_then(|s| s.get_mut("sockopt"))
+                .and_then(|s| s.as_object_mut())
+            {
+                sockopt.insert("interface".to_string(), json!(iface));
+            }
+        }
+        let in_tag = format!("in-{}", slot);
+        inbounds.push(json!({
+            "tag": in_tag,
+            "listen": "127.0.0.1",
+            "port": *port,
+            "protocol": "http"
+        }));
+        outbounds.push(out);
+        rules.push(json!({
+            "type": "field",
+            "inboundTag": [in_tag],
+            "outboundTag": out_tag
+        }));
+        valid.push((*node_idx, *port));
+    }
+
+    if valid.is_empty() {
+        return Err("No valid server configurations in batch.".to_string());
+    }
+
+    let cfg = json!({
+        "log": {
+            "access": "none",
+            "loglevel": "none"
+        },
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": rules
+        }
+    });
+
+    let text = serde_json::to_string(&cfg).map_err(|e| e.to_string())?;
+    Ok((text, valid))
+}
+
 pub fn validate_remote_dns(raw: &str) -> Result<String, String> {
     let s = raw.trim();
     if s.is_empty() {
@@ -495,7 +569,7 @@ fn normalize_rule_item(kind: RuleMatchKind, raw: &str) -> String {
     }
 }
 
-fn build_node_outbound(tag: &str, node: &VlessNode) -> Result<Value, String> {
+fn build_node_outbound(tag: &str, node: &VlessNode, opts: OutboundOpts) -> Result<Value, String> {
     let mut user = json!({
         "id": node.uuid,
         "encryption": if node.encryption.is_empty() { "none" } else { &node.encryption }
@@ -521,8 +595,7 @@ fn build_node_outbound(tag: &str, node: &VlessNode) -> Result<Value, String> {
         }
         "tls" => {
             let mut tls = json!({
-                "serverName": if node.sni.is_empty() { &node.address } else { &node.sni },
-                "allowInsecure": node.allow_insecure
+                "serverName": if node.sni.is_empty() { &node.address } else { &node.sni }
             });
             if !node.fp.is_empty() {
                 tls["fingerprint"] = json!(node.fp);
@@ -550,7 +623,6 @@ fn build_node_outbound(tag: &str, node: &VlessNode) -> Result<Value, String> {
             });
             if !node.host.is_empty() {
                 ws["host"] = json!(node.host);
-                ws["headers"] = json!({ "Host": node.host });
             }
             stream["wsSettings"] = ws;
         }
@@ -606,7 +678,28 @@ fn build_node_outbound(tag: &str, node: &VlessNode) -> Result<Value, String> {
         "domainStrategy": "UseIPv4"
     });
 
-    Ok(match node.protocol.as_str() {
+    // Apply native Xray-core 26.x finalmask TCP TLS Fragment on TCP-based TLS/REALITY transports
+    if opts.fragment
+        && matches!(node.protocol.as_str(), "vless" | "vmess" | "trojan")
+        && matches!(node.security.as_str(), "tls" | "reality")
+        && matches!(
+            node.network.as_str(),
+            "tcp" | "raw" | "ws" | "grpc" | "xhttp" | "splithttp" | "httpupgrade"
+        )
+    {
+        stream["finalmask"] = json!({
+            "tcp": [{
+                "type": "fragment",
+                "settings": {
+                    "packets": "tlshello",
+                    "lengths": ["10-20"],
+                    "delays": ["10-20"]
+                }
+            }]
+        });
+    }
+
+    let mut out = match node.protocol.as_str() {
         "trojan" => json!({
             "tag": tag,
             "protocol": "trojan",
@@ -615,6 +708,25 @@ fn build_node_outbound(tag: &str, node: &VlessNode) -> Result<Value, String> {
                     "address": node.address,
                     "port": node.port,
                     "password": node.uuid
+                }]
+            },
+            "streamSettings": stream
+        }),
+        "vmess" => json!({
+            "tag": tag,
+            "protocol": "vmess",
+            "settings": {
+                "vnext": [{
+                    "address": node.address,
+                    "port": node.port,
+                    "users": [{
+                        "id": node.uuid,
+                        "security": if node.encryption.is_empty() || node.encryption == "none" {
+                            "auto"
+                        } else {
+                            &node.encryption
+                        }
+                    }]
                 }]
             },
             "streamSettings": stream
@@ -636,6 +748,191 @@ fn build_node_outbound(tag: &str, node: &VlessNode) -> Result<Value, String> {
                 }
             }
         }),
+        "hysteria" => {
+            let mut tls = json!({
+                "serverName": if node.sni.is_empty() { &node.address } else { &node.sni }
+            });
+            if !node.alpn.is_empty() {
+                let list: Vec<&str> = node
+                    .alpn
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !list.is_empty() {
+                    tls["alpn"] = json!(list);
+                }
+            }
+            let mut hy_stream = json!({
+                "network": "hysteria",
+                "security": "tls",
+                "tlsSettings": tls,
+                "hysteriaSettings": {
+                    "version": 2,
+                    "auth": node.uuid,
+                    "udpIdleTimeout": 60
+                },
+                "sockopt": {
+                    "domainStrategy": "UseIPv4"
+                }
+            });
+            let mut udp_masks: Vec<Value> = Vec::new();
+            if node.obfs == "salamander" && !node.obfs_password.is_empty() {
+                udp_masks.push(json!({
+                    "type": "salamander",
+                    "settings": {
+                        "password": node.obfs_password
+                    }
+                }));
+            }
+            if opts.noise {
+                udp_masks.push(json!({
+                    "type": "noise",
+                    "settings": {
+                        "reset": "30-60",
+                        "noise": [{
+                            "rand": "10-20",
+                            "delay": "10-20"
+                        }]
+                    }
+                }));
+            }
+            if !udp_masks.is_empty() {
+                hy_stream["finalmask"] = json!({ "udp": udp_masks });
+            }
+            json!({
+                "tag": tag,
+                "protocol": "hysteria",
+                "settings": {
+                    "version": 2,
+                    "address": node.address,
+                    "port": node.port
+                },
+                "streamSettings": hy_stream
+            })
+        }
+        "wireguard" => {
+            let addrs: Vec<String> = node
+                .wg_address
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let addrs = if addrs.is_empty() {
+                vec!["172.16.0.2/32".to_string()]
+            } else {
+                addrs
+            };
+            let ep_host = if node.address.contains(':') {
+                format!("[{}]", node.address)
+            } else {
+                node.address.clone()
+            };
+            let mut peer = json!({
+                "publicKey": node.pbk,
+                "endpoint": format!("{}:{}", ep_host, node.port),
+                "keepAlive": 25
+            });
+            if !node.sid.is_empty() {
+                peer["preSharedKey"] = json!(node.sid);
+            }
+            let mtu = if node.wg_mtu >= 1280 { node.wg_mtu } else { 1420 };
+            let mut wg_settings = json!({
+                "secretKey": node.uuid,
+                "address": addrs,
+                "peers": [peer],
+                "mtu": mtu,
+                "noKernelTun": true
+            });
+            let reserved: Vec<u8> = node
+                .wg_reserved
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u8>().ok())
+                .collect();
+            if reserved.len() == 3 {
+                wg_settings["reserved"] = json!(reserved);
+            }
+            let mut wg_stream = json!({
+                "sockopt": {
+                    "domainStrategy": "UseIPv4"
+                }
+            });
+            if opts.noise {
+                wg_stream["finalmask"] = json!({
+                    "udp": [{
+                        "type": "noise",
+                        "settings": {
+                            "reset": "30-60",
+                            "noise": [{
+                                "rand": "10-20",
+                                "delay": "10-20"
+                            }]
+                        }
+                    }]
+                });
+            }
+            json!({
+                "tag": tag,
+                "protocol": "wireguard",
+                "settings": wg_settings,
+                "streamSettings": wg_stream
+            })
+        }
+        "socks" => {
+            let mut srv = json!({
+                "address": node.address,
+                "port": node.port
+            });
+            if !node.proxy_user.is_empty() || !node.uuid.is_empty() {
+                srv["users"] = json!([{
+                    "user": node.proxy_user,
+                    "pass": node.uuid
+                }]);
+            }
+            json!({
+                "tag": tag,
+                "protocol": "socks",
+                "settings": {
+                    "servers": [srv]
+                },
+                "streamSettings": {
+                    "sockopt": {
+                        "domainStrategy": "UseIPv4"
+                    }
+                }
+            })
+        }
+        "http" => {
+            let mut srv = json!({
+                "address": node.address,
+                "port": node.port
+            });
+            if !node.proxy_user.is_empty() || !node.uuid.is_empty() {
+                srv["users"] = json!([{
+                    "user": node.proxy_user,
+                    "pass": node.uuid
+                }]);
+            }
+            let mut http_stream = json!({
+                "sockopt": {
+                    "domainStrategy": "UseIPv4"
+                }
+            });
+            if node.security == "tls" {
+                http_stream["security"] = json!("tls");
+                http_stream["tlsSettings"] = json!({
+                    "serverName": if node.sni.is_empty() { &node.address } else { &node.sni }
+                });
+            }
+            json!({
+                "tag": tag,
+                "protocol": "http",
+                "settings": {
+                    "servers": [srv]
+                },
+                "streamSettings": http_stream
+            })
+        }
         _ => json!({
             "tag": tag,
             "protocol": "vless",
@@ -648,7 +945,29 @@ fn build_node_outbound(tag: &str, node: &VlessNode) -> Result<Value, String> {
             },
             "streamSettings": stream
         }),
-    })
+    };
+
+    // Apply Mux (XUDP) only on compatible protocols/transports (skip XTLS Vision, XHTTP, QUIC/WG).
+    let mux_compat = match node.protocol.as_str() {
+        "vless" => {
+            !node.flow.to_lowercase().contains("vision")
+                && !matches!(node.network.as_str(), "xhttp" | "splithttp")
+        }
+        "vmess" | "trojan" | "shadowsocks" => {
+            !matches!(node.network.as_str(), "xhttp" | "splithttp")
+        }
+        _ => false,
+    };
+    if opts.mux && mux_compat {
+        out["mux"] = json!({
+            "enabled": true,
+            "concurrency": 8,
+            "xudpConcurrency": 16,
+            "xudpProxyUDP443": "reject"
+        });
+    }
+
+    Ok(out)
 }
 
 fn ip_to_host_cidr(ip: &str) -> String {
@@ -974,5 +1293,97 @@ mod tests {
         assert!(cfg_dns_ip.contains("\"loglevel\": \"none\""));
         assert!(cfg_dns_ip.contains("\"domainStrategy\": \"IPOnDemand\""));
         run_xray_test(&core, "settings_custom_dns_ip", &cfg_dns_ip);
+    }
+
+    #[test]
+    fn new_protocols_and_finalmask_pass_real_xray_test() {
+        let core = crate::model::core_binary_path().expect("core/avel-core.exe must exist");
+        let run_ok = |name: &str, cfg: &str| {
+            let p = crate::model::core_dir().join(format!("_ut_{}.json", name));
+            std::fs::write(&p, cfg).unwrap();
+            let out = std::process::Command::new(&core)
+                .args(["run", "-test", "-c"])
+                .arg(&p)
+                .current_dir(crate::model::core_dir())
+                .output()
+                .unwrap();
+            let _ = std::fs::remove_file(&p);
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                out.status.success(),
+                "xray -test failed for {}: {}",
+                name,
+                combined
+            );
+        };
+
+        let vmess_uri = format!(
+            "vmess://{}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                br#"{"v":"2","ps":"VM","add":"vm.example.com","port":"443","id":"11111111-1111-1111-1111-111111111111","scy":"auto","net":"ws","host":"vm.example.com","path":"/ws","tls":"tls","sni":"vm.example.com"}"#
+            )
+        );
+        let n_vmess = crate::vless::parse_vmess_uri(&vmess_uri).unwrap();
+        let n_hy2 = crate::vless::parse_hysteria2_uri(
+            "hy2://secret@hy.example.com:8443?sni=hy.example.com&insecure=1&obfs=salamander&obfs-password=salpass#Hy2",
+        )
+        .unwrap();
+        let n_wg = crate::vless::parse_wireguard_uri(
+            "wireguard://AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA%3D@wg.example.com:51820?publickey=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB%3D&address=172.16.0.2%2F32&reserved=1,2,3&mtu=1280#WG",
+        )
+        .unwrap();
+        let n_socks =
+            crate::vless::parse_socks_uri("socks5://alice:bob@socks.example.com:1080#Socks")
+                .unwrap();
+        let n_http =
+            crate::vless::parse_http_proxy_uri("http://u1:p1@proxy.example.com:8080#Http").unwrap();
+        let n_vless_tls = parse_vless_uri(
+            "vless://11111111-1111-1111-1111-111111111111@v.example.com:443?security=tls&sni=v.example.com&type=tcp#VlessTls",
+        )
+        .unwrap();
+
+        let mut st_adv = AppState::default();
+        st_adv.mode = ProxyMode::SystemProxy;
+        st_adv.enable_fragment = true;
+        st_adv.enable_noise = true;
+        st_adv.enable_mux = true;
+
+        let cfg_vless = build_xray_config(&st_adv, &n_vless_tls).unwrap();
+        assert!(cfg_vless.contains("\"fragment\""));
+        assert!(cfg_vless.contains("\"xudpConcurrency\": 16"));
+        run_ok("vless_fragment_mux", &cfg_vless);
+
+        let cfg_vmess = build_xray_config(&st_adv, &n_vmess).unwrap();
+        run_ok("vmess_fragment_mux", &cfg_vmess);
+
+        let cfg_hy2 = build_xray_config(&st_adv, &n_hy2).unwrap();
+        assert!(cfg_hy2.contains("\"hysteriaSettings\""));
+        assert!(cfg_hy2.contains("\"salamander\""));
+        assert!(cfg_hy2.contains("\"noise\""));
+        run_ok("hysteria2_salamander_noise", &cfg_hy2);
+
+        let cfg_wg = build_xray_config(&st_adv, &n_wg).unwrap();
+        assert!(cfg_wg.contains("\"noKernelTun\": true"));
+        run_ok("wireguard_noise", &cfg_wg);
+
+        let cfg_socks = build_xray_config(&st_adv, &n_socks).unwrap();
+        run_ok("socks5_outbound", &cfg_socks);
+
+        let cfg_http = build_xray_config(&st_adv, &n_http).unwrap();
+        run_ok("http_outbound", &cfg_http);
+
+        let (batch_cfg, valid_entries) = build_batch_test_config(
+            &[(0, n_vless_tls, 19411), (1, n_hy2, 19412), (2, n_socks, 19413)],
+            Some("Wi-Fi"),
+            OutboundOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(valid_entries.len(), 3);
+        run_ok("batch_real_ping", &batch_cfg);
     }
 }

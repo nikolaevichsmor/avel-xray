@@ -6,7 +6,8 @@ use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 use std::ptr::null_mut;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -308,6 +309,109 @@ impl Drop for XrayRunner {
     }
 }
 
+static TEMP_CFG_SEQ: AtomicU32 = AtomicU32::new(1);
+
+// Ephemeral background Xray instance for Real Delay probing; auto-killed via Job Object on Drop.
+pub struct TempXrayProcess {
+    child: Option<Child>,
+    job: HANDLE,
+    cfg_path: PathBuf,
+}
+
+unsafe impl Send for TempXrayProcess {}
+
+impl TempXrayProcess {
+    pub fn start(
+        config_json: &str,
+        ready_port: u16,
+        cancel: &AtomicBool,
+    ) -> Result<Self, String> {
+        let cdir = core_dir();
+        let xray = core_binary_path()?;
+        let seq = TEMP_CFG_SEQ.fetch_add(1, Ordering::Relaxed);
+        let cfg_path = cdir.join(format!("realping_{}_{}.json", std::process::id(), seq));
+        std::fs::write(&cfg_path, config_json)
+            .map_err(|e| format!("Failed to write test config: {}", e))?;
+
+        let mut cmd = Command::new(&xray);
+        cmd.args(["run", "-c"])
+            .arg(&cfg_path)
+            .current_dir(&cdir)
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .env("GOGC", "50")
+            .env("GOMEMLIMIT", "48MiB");
+
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(&cfg_path);
+                return Err(format!("Failed to start test core: {}", e));
+            }
+        };
+
+        let mut job: HANDLE = null_mut();
+        unsafe {
+            let proc_h = child.as_raw_handle() as HANDLE;
+            let j = CreateJobObjectW(null_mut(), null_mut());
+            if !j.is_null() {
+                let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                SetInformationJobObject(
+                    j,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                );
+                AssignProcessToJobObject(j, proc_h);
+                job = j;
+            }
+        }
+
+        let mut proc = Self {
+            child: Some(child),
+            job,
+            cfg_path,
+        };
+
+        let addr: SocketAddr = ([127, 0, 0, 1], ready_port).into();
+        for _ in 0..90 {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled".to_string());
+            }
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(60)).is_ok() {
+                return Ok(proc);
+            }
+            if let Some(ref mut ch) = proc.child {
+                if let Ok(Some(_)) = ch.try_wait() {
+                    return Err("Test core exited before ready.".to_string());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(35));
+        }
+
+        Err("Test core did not open local port in time.".to_string())
+    }
+}
+
+impl Drop for TempXrayProcess {
+    fn drop(&mut self) {
+        if let Some(mut ch) = self.child.take() {
+            let _ = ch.kill();
+            let _ = ch.wait();
+        }
+        if !self.job.is_null() {
+            unsafe {
+                CloseHandle(self.job);
+            }
+            self.job = null_mut();
+        }
+        let _ = std::fs::remove_file(&self.cfg_path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +516,36 @@ mod tests {
             "loglevel=none startup stalled for {:?} instead of fast port probe",
             elapsed
         );
+    }
+
+    #[test]
+    fn temp_xray_process_starts_and_cleans_up_on_drop() {
+        let _guard = PROC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let node = parse_vless_uri(
+            "vless://11111111-1111-1111-1111-111111111111@127.0.0.1:443?encryption=none&security=none&type=tcp#BatchLocal",
+        )
+        .unwrap();
+        let port = 18849u16;
+        let (cfg, valid) = crate::xray_config::build_batch_test_config(
+            &[(0, node, port)],
+            None,
+            crate::xray_config::OutboundOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(valid, vec![(0, port)]);
+        let cancel = AtomicBool::new(false);
+        let cfg_path = {
+            let proc = TempXrayProcess::start(&cfg, port, &cancel)
+                .expect("TempXrayProcess failed to start");
+            let p = proc.cfg_path.clone();
+            assert!(p.exists(), "temp realping config file should exist while running");
+            assert!(
+                TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(200))
+                    .is_ok(),
+                "temp xray HTTP port should accept connections"
+            );
+            p
+        };
+        assert!(!cfg_path.exists(), "temp realping config file must be deleted on Drop");
     }
 }

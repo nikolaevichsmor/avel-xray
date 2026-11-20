@@ -249,48 +249,43 @@ impl RoutingRule {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StabilityStats {
-    pub probes_done: u8,
-    pub probes_total: u8,
-    pub avg_ms: u32,
-    pub jitter_ms: u32,
-    pub loss_pct: u8,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionProfile {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub update_interval_hours: u32,
+    #[serde(default)]
+    pub last_updated_unix: u64,
+    #[serde(default)]
+    pub userinfo: String,
 }
 
-impl StabilityStats {
-    pub fn quality_label(&self) -> &'static str {
-        if self.loss_pct >= 100 {
-            "Dead"
-        } else if self.loss_pct == 0 && self.avg_ms <= 80 && self.jitter_ms <= 10 {
-            "Good"
-        } else if self.loss_pct == 0 && self.avg_ms <= 150 && self.jitter_ms <= 25 {
-            "Fair"
+impl SubscriptionProfile {
+    pub fn display_label(&self) -> String {
+        let base = if !self.name.trim().is_empty() {
+            self.name.trim().to_string()
         } else {
-            "Poor"
+            short_sub_host(&self.url)
+        };
+        if !self.userinfo.is_empty() {
+            format!("{} ({})", base, self.userinfo)
+        } else {
+            base
         }
     }
+}
 
-    pub fn format_badge(&self) -> String {
-        if self.probes_done < self.probes_total {
-            if self.loss_pct >= 100 {
-                format!("{}/{} loss", self.probes_done, self.probes_total)
-            } else {
-                format!(
-                    "{}/{} ±{}ms {}%",
-                    self.probes_done, self.probes_total, self.jitter_ms, self.loss_pct
-                )
-            }
-        } else if self.loss_pct >= 100 {
-            "Dead 100%".to_string()
-        } else {
-            format!(
-                "{} ±{}ms {}%",
-                self.quality_label(),
-                self.jitter_ms,
-                self.loss_pct
-            )
-        }
+pub fn short_sub_host(url: &str) -> String {
+    let s = url.trim();
+    let after = s.split_once("://").map(|(_, r)| r).unwrap_or(s);
+    let host = after.split('/').next().unwrap_or(s);
+    if host.is_empty() {
+        s.to_string()
+    } else {
+        host.to_string()
     }
 }
 
@@ -339,11 +334,23 @@ pub struct VlessNode {
     #[serde(default)]
     pub extra: String,
     #[serde(default)]
+    pub obfs: String,
+    #[serde(default)]
+    pub obfs_password: String,
+    #[serde(default)]
+    pub wg_address: String,
+    #[serde(default)]
+    pub wg_reserved: String,
+    #[serde(default)]
+    pub wg_mtu: u16,
+    #[serde(default)]
+    pub proxy_user: String,
+    #[serde(default)]
+    pub source_sub_id: Option<String>,
+    #[serde(default)]
     pub raw_uri: String,
     #[serde(skip)]
     pub ping_ms: Option<u32>,
-    #[serde(skip)]
-    pub stability: Option<StabilityStats>,
 }
 
 fn default_protocol() -> String {
@@ -360,13 +367,8 @@ fn default_network() -> String {
 }
 
 impl VlessNode {
-    pub fn display_details(&self) -> String {
-        let ping = match self.ping_ms {
-            Some(0) => "timeout".to_string(),
-            Some(ms) => format!("{} ms", ms),
-            None => "-".to_string(),
-        };
-        let proto_tag = match self.protocol.as_str() {
+    pub fn protocol_tag(&self) -> String {
+        match self.protocol.as_str() {
             "shadowsocks" => {
                 let m = if self.ss_method.is_empty() { "ss" } else { &self.ss_method };
                 format!("ss/{}", m)
@@ -375,6 +377,18 @@ impl VlessNode {
                 let sec = if self.security == "reality" { "reality" } else { "tls" };
                 format!("trojan/{}", sec)
             }
+            "vmess" => {
+                let net = if self.network.is_empty() { "tcp" } else { &self.network };
+                if self.security == "tls" {
+                    format!("vmess/{}", net)
+                } else {
+                    format!("vmess/{}", net)
+                }
+            }
+            "hysteria" => "hysteria2".to_string(),
+            "wireguard" => "wireguard".to_string(),
+            "socks" => "socks5".to_string(),
+            "http" => "http".to_string(),
             _ => {
                 let sec = match self.security.as_str() {
                     "reality" => "reality",
@@ -383,26 +397,117 @@ impl VlessNode {
                 };
                 format!("{}/{}", self.network, sec)
             }
+        }
+    }
+
+    pub fn to_share_uri(&self) -> String {
+        let raw = self.raw_uri.trim();
+        if !raw.is_empty() && !raw.starts_with("vmess://") {
+            let base = match raw.find('#') {
+                Some(pos) => &raw[..pos],
+                None => raw,
+            };
+            return format!("{}#{}", base, percent_encode_fragment(&self.name));
+        }
+        let host = if self.address.contains(':') {
+            format!("[{}]", self.address)
+        } else {
+            self.address.clone()
         };
-        match self.stability {
-            Some(st) => format!(
-                "  [{}:{}, {}]  [{}]  [{}]",
-                self.address,
-                self.port,
-                proto_tag,
-                ping,
-                st.format_badge()
+        let frag = percent_encode_fragment(&self.name);
+        match self.protocol.as_str() {
+            "vmess" => {
+                use base64::Engine;
+                let obj = serde_json::json!({
+                    "v": "2",
+                    "ps": self.name,
+                    "add": self.address,
+                    "port": self.port.to_string(),
+                    "id": self.uuid,
+                    "aid": "0",
+                    "scy": if self.encryption.is_empty() { "auto" } else { &self.encryption },
+                    "net": if self.network.is_empty() { "tcp" } else { &self.network },
+                    "type": if self.header_type.is_empty() { "none" } else { &self.header_type },
+                    "host": self.host,
+                    "path": if self.network == "grpc" && !self.service_name.is_empty() { &self.service_name } else { &self.path },
+                    "tls": if self.security == "tls" { "tls" } else { "" },
+                    "sni": self.sni,
+                    "alpn": self.alpn,
+                    "fp": self.fp,
+                });
+                let b64 = base64::engine::general_purpose::STANDARD.encode(obj.to_string().as_bytes());
+                format!("vmess://{}", b64)
+            }
+            "shadowsocks" => {
+                use base64::Engine;
+                let method = if self.ss_method.is_empty() {
+                    "aes-128-gcm"
+                } else {
+                    &self.ss_method
+                };
+                let userinfo = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(format!("{}:{}", method, self.uuid).as_bytes());
+                format!("ss://{}@{}:{}#{}", userinfo, host, self.port, frag)
+            }
+            "trojan" => format!(
+                "trojan://{}@{}:{}?security={}&sni={}#{}",
+                self.uuid, host, self.port, self.security, self.sni, frag
             ),
-            None => format!(
-                "  [{}:{}, {}]  [{}]",
-                self.address, self.port, proto_tag, ping
+            "hysteria" => format!(
+                "hy2://{}@{}:{}?sni={}#{}",
+                self.uuid, host, self.port, self.sni, frag
+            ),
+            "wireguard" => format!(
+                "wireguard://{}@{}:{}?publickey={}&address={}#{}",
+                self.uuid, host, self.port, self.pbk, self.wg_address, frag
+            ),
+            "socks" => {
+                if self.proxy_user.is_empty() {
+                    format!("socks5://{}:{}#{}", host, self.port, frag)
+                } else {
+                    format!(
+                        "socks5://{}:{}@{}:{}#{}",
+                        self.proxy_user, self.uuid, host, self.port, frag
+                    )
+                }
+            }
+            "http" => {
+                if self.proxy_user.is_empty() {
+                    format!("http://{}:{}#{}", host, self.port, frag)
+                } else {
+                    format!(
+                        "http://{}:{}@{}:{}#{}",
+                        self.proxy_user, self.uuid, host, self.port, frag
+                    )
+                }
+            }
+            _ => format!(
+                "vless://{}@{}:{}?encryption={}&security={}&type={}&sni={}#{}",
+                self.uuid, host, self.port, self.encryption, self.security, self.network, self.sni, frag
             ),
         }
     }
 
     pub fn display_row(&self) -> String {
-        format!("{}{}", self.name, self.display_details())
+        let ping = match self.ping_ms {
+            Some(0) => "timeout".to_string(),
+            Some(ms) => format!("{} ms", ms),
+            None => "-".to_string(),
+        };
+        format!("{}  {}  {}  {}", self.name, self.address, self.protocol_tag(), ping)
     }
+}
+
+fn percent_encode_fragment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +516,8 @@ pub struct AppState {
     pub subscription_url: String,
     #[serde(default)]
     pub subscription_info: String,
+    #[serde(default)]
+    pub subscriptions: Vec<SubscriptionProfile>,
     #[serde(default)]
     pub nodes: Vec<VlessNode>,
     #[serde(default)]
@@ -451,6 +558,16 @@ pub struct AppState {
     pub auto_connect_on_launch: bool,
     #[serde(default)]
     pub start_minimized: bool,
+    #[serde(default)]
+    pub enable_fragment: bool,
+    #[serde(default)]
+    pub enable_noise: bool,
+    #[serde(default)]
+    pub enable_mux: bool,
+    #[serde(default)]
+    pub send_hwid: bool,
+    #[serde(default)]
+    pub last_update_check_unix: u64,
 }
 
 fn default_true() -> bool {
@@ -477,6 +594,7 @@ impl Default for AppState {
         Self {
             subscription_url: String::new(),
             subscription_info: String::new(),
+            subscriptions: Vec::new(),
             nodes: Vec::new(),
             selected_index: 0,
             mode: ProxyMode::SystemProxy,
@@ -497,6 +615,11 @@ impl Default for AppState {
             memory_profile: MemoryProfile::LowRam,
             auto_connect_on_launch: false,
             start_minimized: false,
+            enable_fragment: false,
+            enable_noise: false,
+            enable_mux: false,
+            send_hwid: false,
+            last_update_check_unix: 0,
         }
     }
 }
@@ -584,6 +707,26 @@ impl AppState {
                 if st.user_agent.trim().is_empty() {
                     st.user_agent = default_user_agent();
                 }
+                // Migrate legacy single subscription_url into multi-subscription list seamlessly.
+                let sub_trim = st.subscription_url.trim().to_string();
+                if st.subscriptions.is_empty()
+                    && (sub_trim.starts_with("https://") || sub_trim.starts_with("http://"))
+                {
+                    let sub_id = "sub-1".to_string();
+                    st.subscriptions.push(SubscriptionProfile {
+                        id: sub_id.clone(),
+                        name: short_sub_host(&sub_trim),
+                        url: sub_trim,
+                        update_interval_hours: 0,
+                        last_updated_unix: 0,
+                        userinfo: st.subscription_info.clone(),
+                    });
+                    for n in &mut st.nodes {
+                        if n.source_sub_id.is_none() {
+                            n.source_sub_id = Some(sub_id.clone());
+                        }
+                    }
+                }
                 if st.selected_index >= st.nodes.len() && !st.nodes.is_empty() {
                     st.selected_index = 0;
                 }
@@ -591,6 +734,17 @@ impl AppState {
             }
         }
         AppState::default()
+    }
+
+    pub fn next_subscription_id(&self) -> String {
+        let mut n = self.subscriptions.len() + 1;
+        loop {
+            let cand = format!("sub-{}", n);
+            if !self.subscriptions.iter().any(|s| s.id == cand) {
+                return cand;
+            }
+            n += 1;
+        }
     }
 
     pub fn reset_settings_to_defaults(&mut self) {
@@ -606,6 +760,10 @@ impl AppState {
         self.user_agent = default_user_agent();
         self.auto_connect_on_launch = false;
         self.start_minimized = false;
+        self.enable_fragment = false;
+        self.enable_noise = false;
+        self.enable_mux = false;
+        self.send_hwid = false;
     }
 
     pub fn save(&self) -> Result<(), String> {
