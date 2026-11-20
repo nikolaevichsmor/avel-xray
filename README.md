@@ -17,7 +17,7 @@ Native Win32 VPN client for Xray-core on Windows x64, written in Rust directly a
 
 ### Lightweight by design
 
-Most desktop Xray clients bundle a browser engine, Flutter, Qt, or .NET runtime, taking **80-250 MB of RAM** and holding GPU VRAM for the UI alone even when sitting in the tray. `avel-xray` is a **~700 KB** native Win32 executable whose GUI stays around **3-5 MB of RAM** and **0 MB of VRAM** (plus `avel-core.exe` itself), so it **never wakes a laptop discrete GPU** or eats memory in the background. In Global and process-only modes it skips loading `geoip.dat` and `geosite.dat` altogether, keeping `avel-core.exe` light too.
+Most desktop Xray clients bundle a browser engine, Flutter, Qt, or .NET runtime, taking **80-250 MB of RAM** and holding GPU VRAM for the UI alone even when sitting in the tray. `avel-xray` is a **~850 KB** native Win32 executable whose GUI stays around **3-5 MB of RAM** and **0 MB of VRAM** (plus `avel-core.exe` itself), so it **never wakes a laptop discrete GPU** or eats memory in the background. In Global and process-only modes it skips loading `geoip.dat` and `geosite.dat` altogether, keeping `avel-core.exe` light too.
 
 ### Clean TUN networking & leak protection
 
@@ -25,13 +25,13 @@ There is **no 24/7 SYSTEM background service**. `avel-core.exe` runs inside a Wi
 
 ### Protocols, routing & verifiable builds
 
-Supports **VLESS** (Reality, TLS, XHTTP / SplitHTTP, WebSocket, gRPC, HTTPUpgrade, post-quantum ML-KEM-768+X25519), **Trojan**, and **Shadowsocks** (including SS-2022) in both **System Proxy** and **Wintun TUN** modes. Route traffic by `.exe`, folder, domain (`geosite:`), or IP (`geoip:`) to Direct, Block, the active server, or another node from your subscription, and configure **TUN MTU**, local ports, `Allow LAN`, custom Remote DNS, log level, Go memory profile, and HTTPS Geo updates in the Settings tab. Release archives are compiled directly by **GitHub Actions** with **SHA256-verified** official `Xray-core` and `Wintun` binaries, DLL loading is locked to `System32`, and temporary configs are deleted on disconnect.
+Supports **VLESS** (Reality, TLS, XHTTP / SplitHTTP, WebSocket, gRPC, HTTPUpgrade, post-quantum ML-KEM-768+X25519), **VMess**, **Trojan**, **Shadowsocks** (including SS-2022), **Hysteria2** (`salamander` obfs), **WireGuard**, **SOCKS5**, and **HTTP** proxies in both **System Proxy** and **Wintun TUN** modes. Includes **multi-subscriptions** (non-destructive updates, `profile-update-interval` auto-refresh, proxy fallback when connected, `profile-title` / `subscription-userinfo`, optional HWID headers), clipboard import (`Ctrl+V` / `Add`), server rename/edit/copy URI, separate **TCP Ping** and end-to-end **Real Ping** (`HTTPS /generate_204`), plus native Xray 26.x **TLS Fragment**, **UDP Noise**, and **Mux (XUDP)** controls. Route traffic by `.exe`, folder, domain (`geosite:`), or IP (`geoip:`) to Direct, Block, the active server, or another node, and configure TUN MTU, ports, `Allow LAN`, Remote DNS, log level, Go memory profile, HTTPS Geo updates, and automatic SHA256-verified GitHub release checks in Settings. Release archives are compiled directly by **GitHub Actions** with **SHA256-verified** official `Xray-core` and `Wintun` binaries, DLL loading is locked to `System32`, and temporary configs are deleted on disconnect.
 
 ## Download
 
 1. Download `avel-xray-<version>-windows-x64.zip` from [Releases](https://github.com/nikolaevichsmor/avel-xray/releases).
 2. Extract to any folder and run `avel.exe` (portable, no installer).
-3. Paste a subscription URL or a `vless://` / `trojan://` / `ss://` link, click **Update**, pick a server, and click **Connect**.
+3. Paste a subscription URL or proxy link (`vless://`, `vmess://`, `trojan://`, `ss://`, `hy2://`, `wireguard://`, `socks5://`, `http://`), click **Update** or **Add** (or press `Ctrl+V` in the server list), pick a server, and click **Connect**.
 
 > [!NOTE]
 > **System Proxy** works with standard user permissions. Switching to **TUN mode** automatically requests UAC elevation once; enabling **Autostart** while elevated registers a silent logon task with no UAC prompt on reboot.
