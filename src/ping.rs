@@ -1,5 +1,9 @@
-use crate::model::{StabilityStats, VlessNode};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use crate::http_win::probe_http_proxy_real_delay;
+use crate::model::VlessNode;
+use crate::xray_config::{build_batch_test_config, OutboundOpts};
+use crate::xray_proc::TempXrayProcess;
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once};
@@ -22,8 +26,8 @@ fn ensure_wsa() {
     });
 }
 
-// Find the IPv4 interface index of the active physical adapter so TCP ping bypasses TUN.
-fn find_physical_ipv4_if_index() -> Option<u32> {
+// Find the IPv4 interface index and FriendlyName of the active physical adapter so probes bypass TUN.
+fn find_physical_ipv4_if_info() -> Option<(u32, String)> {
     unsafe {
         let mut buf_len: u32 = 32 * 1024;
         // u64 backing guarantees 8-byte alignment required by IP_ADAPTER_ADDRESSES_LH
@@ -53,16 +57,16 @@ fn find_physical_ipv4_if_index() -> Option<u32> {
         let mut cur = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
         while !cur.is_null() {
             let a = &*cur;
-            // OperStatus == 1 (IfOperStatusUp), IfType != 24 (loopback), has IPv4 gateway
             let if_idx = a.Anonymous1.Anonymous.IfIndex;
             let is_up = a.OperStatus == 1;
             let is_loopback = a.IfType == 24;
             let has_gw = !a.FirstGatewayAddress.is_null();
 
             if is_up && !is_loopback && has_gw && if_idx > 0 {
+                let raw_name = wide_ptr_to_string(a.FriendlyName);
                 let desc = wide_ptr_to_string(a.Description).to_lowercase();
-                let name = wide_ptr_to_string(a.FriendlyName).to_lowercase();
-                let combined = format!("{} {}", desc, name);
+                let name_lc = raw_name.to_lowercase();
+                let combined = format!("{} {}", desc, name_lc);
                 let is_virtual = combined.contains("wintun")
                     || combined.contains("avel")
                     || combined.contains("tunnel")
@@ -72,13 +76,17 @@ fn find_physical_ipv4_if_index() -> Option<u32> {
                     || combined.contains("wireguard")
                     || combined.contains("tap-windows");
                 if !is_virtual {
-                    return Some(if_idx);
+                    return Some((if_idx, raw_name));
                 }
             }
             cur = a.Next;
         }
     }
     None
+}
+
+fn find_physical_ipv4_if_index() -> Option<u32> {
+    find_physical_ipv4_if_info().map(|(idx, _)| idx)
 }
 
 unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
@@ -205,107 +213,6 @@ pub fn tcp_ping_node(address: &str, port: u16, phys_if: Option<u32>) -> u32 {
     probe_resolved_addrs(&addrs_vec, port, phys_if, 2000)
 }
 
-pub fn compute_stability_stats(samples: &[u32], probes_total: u8) -> StabilityStats {
-    let done = samples.len().min(u8::MAX as usize) as u8;
-    let ok: Vec<u32> = samples.iter().copied().filter(|&ms| ms > 0).collect();
-    if done == 0 || ok.is_empty() {
-        return StabilityStats {
-            probes_done: done,
-            probes_total,
-            avg_ms: 0,
-            jitter_ms: 0,
-            loss_pct: if done == 0 { 0 } else { 100 },
-        };
-    }
-
-    let failed = (done as usize).saturating_sub(ok.len());
-    let loss_pct = ((failed * 100 + (done as usize) / 2) / (done as usize)).min(100) as u8;
-    let sum: u64 = ok.iter().map(|&v| v as u64).sum();
-    let avg_ms = ((sum + (ok.len() as u64) / 2) / (ok.len() as u64)) as u32;
-
-    let jitter_ms = if ok.len() >= 2 {
-        let diff_sum: u64 = ok
-            .windows(2)
-            .map(|w| w[0].abs_diff(w[1]) as u64)
-            .sum();
-        let cnt = (ok.len() - 1) as u64;
-        ((diff_sum + cnt / 2) / cnt) as u32
-    } else {
-        0
-    };
-
-    StabilityStats {
-        probes_done: done,
-        probes_total,
-        avg_ms,
-        jitter_ms,
-        loss_pct,
-    }
-}
-
-pub fn stability_test_all_async(
-    nodes: Vec<(usize, String, u16)>,
-    probes: u8,
-    interval_ms: u64,
-    cancel: Arc<AtomicBool>,
-    on_progress: impl Fn(usize, StabilityStats) + Send + Sync + 'static,
-    on_done: impl Fn() + Send + 'static,
-) {
-    let cb = Arc::new(on_progress);
-    let total = probes.max(1);
-    std::thread::spawn(move || {
-        let phys_if = find_physical_ipv4_if_index();
-        for chunk in nodes.chunks(8) {
-            if cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            let mut handles = Vec::new();
-            for &(idx, ref addr, port) in chunk {
-                let a = addr.clone();
-                let c = cb.clone();
-                let cancel_t = cancel.clone();
-                handles.push(std::thread::spawn(move || {
-                    let target = format!("{}:{}", a, port);
-                    let addrs_vec: Vec<SocketAddr> = target
-                        .to_socket_addrs()
-                        .map(|it| it.collect())
-                        .unwrap_or_default();
-
-                    let mut samples: Vec<u32> = Vec::with_capacity(total as usize);
-                    for p in 0..total {
-                        if cancel_t.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        let t0 = Instant::now();
-                        let ms = if addrs_vec.is_empty() {
-                            0
-                        } else {
-                            probe_resolved_addrs(&addrs_vec, port, phys_if, 1500)
-                        };
-                        samples.push(ms);
-                        let stats = compute_stability_stats(&samples, total);
-                        c(idx, stats);
-
-                        if p + 1 < total {
-                            let elapsed = t0.elapsed().as_millis() as u64;
-                            let mut rem = interval_ms.saturating_sub(elapsed);
-                            while rem > 0 && !cancel_t.load(Ordering::Relaxed) {
-                                let step = rem.min(50);
-                                std::thread::sleep(Duration::from_millis(step));
-                                rem -= step;
-                            }
-                        }
-                    }
-                }));
-            }
-            for h in handles {
-                let _ = h.join();
-            }
-        }
-        on_done();
-    });
-}
-
 pub fn ping_all_async(
     nodes: Vec<(usize, String, u16)>,
     on_result: impl Fn(usize, u32) + Send + Sync + 'static,
@@ -340,6 +247,102 @@ pub fn extract_ping_targets(nodes: &[VlessNode]) -> Vec<(usize, String, u16)> {
         .collect()
 }
 
+fn allocate_local_ports(count: usize) -> Option<Vec<u16>> {
+    let mut listeners = Vec::with_capacity(count);
+    let mut ports = Vec::with_capacity(count);
+    for _ in 0..count {
+        let l = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+        let port = l.local_addr().ok()?.port();
+        ports.push(port);
+        listeners.push(l);
+    }
+    drop(listeners);
+    Some(ports)
+}
+
+// End-to-end Real Delay test through temporary batched avel-core.exe instances.
+// Returns a single real HTTPS /generate_204 latency (ms) or 0 (timeout) per node.
+pub fn real_ping_all_async(
+    nodes: Vec<(usize, VlessNode)>,
+    bind_physical_if: bool,
+    out_opts: OutboundOpts,
+    cancel: Arc<AtomicBool>,
+    on_result: impl Fn(usize, u32) + Send + Sync + 'static,
+    on_error: impl Fn(String) + Send + Sync + 'static,
+    on_done: impl Fn() + Send + 'static,
+) {
+    let cb = Arc::new(on_result);
+    let err_cb = Arc::new(on_error);
+    std::thread::spawn(move || {
+        let bind_iface = if bind_physical_if {
+            find_physical_ipv4_if_info().map(|(_, name)| name)
+        } else {
+            None
+        };
+
+        for chunk in nodes.chunks(8) {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let Some(ports) = allocate_local_ports(chunk.len()) else {
+                err_cb("Failed to allocate local loopback ports for Real Ping.".to_string());
+                break;
+            };
+            let batch: Vec<(usize, VlessNode, u16)> = chunk
+                .iter()
+                .zip(ports.into_iter())
+                .map(|((idx, node), port)| (*idx, node.clone(), port))
+                .collect();
+
+            let (cfg_json, valid_entries) =
+                match build_batch_test_config(&batch, bind_iface.as_deref(), out_opts) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        for (idx, _, _) in &batch {
+                            cb(*idx, 0);
+                        }
+                        continue;
+                    }
+                };
+
+            let valid_set: HashSet<usize> = valid_entries.iter().map(|(i, _)| *i).collect();
+            for (idx, _, _) in &batch {
+                if !valid_set.contains(idx) {
+                    cb(*idx, 0);
+                }
+            }
+
+            let ready_port = valid_entries[0].1;
+            let _temp_core = match TempXrayProcess::start(&cfg_json, ready_port, &cancel) {
+                Ok(p) => p,
+                Err(e) => {
+                    if !cancel.load(Ordering::Relaxed) {
+                        err_cb(format!("Real Ping failed to start core: {}", e));
+                    }
+                    break;
+                }
+            };
+
+            let mut handles = Vec::with_capacity(valid_entries.len());
+            for (slot, (idx, port)) in valid_entries.into_iter().enumerate() {
+                let c = cb.clone();
+                let cancel_t = cancel.clone();
+                let stagger_ms = (slot as u64) * 45;
+                handles.push(std::thread::spawn(move || {
+                    let ms = probe_http_proxy_real_delay(port, stagger_ms, &cancel_t);
+                    if !cancel_t.load(Ordering::Relaxed) {
+                        c(idx, ms);
+                    }
+                }));
+            }
+            for h in handles {
+                let _ = h.join();
+            }
+        }
+        on_done();
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,26 +353,5 @@ mod tests {
         assert!(phys.is_some(), "Expected an active physical IPv4 interface");
         let ms = tcp_ping_node("1.1.1.1", 443, phys);
         assert!(ms >= 5 && ms < 2000, "Expected real physical TCP RTT (5..2000 ms), got {} ms", ms);
-    }
-
-    #[test]
-    fn compute_stability_stats_metrics_and_quality() {
-        let good = compute_stability_stats(&[30, 32, 31, 33, 30, 32, 31, 30, 32, 31], 10);
-        assert_eq!(good.avg_ms, 31);
-        assert_eq!(good.jitter_ms, 2);
-        assert_eq!(good.loss_pct, 0);
-        assert_eq!(good.quality_label(), "Good");
-
-        let fair = compute_stability_stats(&[95, 110, 100, 115, 98], 5);
-        assert_eq!(fair.loss_pct, 0);
-        assert_eq!(fair.quality_label(), "Fair");
-
-        let lossy = compute_stability_stats(&[30, 0, 32, 31, 30], 5);
-        assert_eq!(lossy.loss_pct, 20);
-        assert_eq!(lossy.quality_label(), "Poor");
-
-        let dead = compute_stability_stats(&[0, 0, 0], 3);
-        assert_eq!(dead.loss_pct, 100);
-        assert_eq!(dead.quality_label(), "Dead");
     }
 }

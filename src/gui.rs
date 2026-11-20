@@ -1,31 +1,32 @@
 use crate::http_win::{
-    check_latest_release, download_and_verify_release, fetch_subscription, is_newer_version,
-    spawn_live_tunnel_monitor, update_geo_databases, LivePingStats, ReleaseInfo,
+    check_latest_release, download_and_verify_release, fetch_subscription_opts, is_newer_version,
+    update_geo_databases, ReleaseInfo, SubscriptionResponse,
 };
 use crate::icon::{create_soft_round_icon, create_watermark_brush};
 use crate::model::{
     app_base_dir, core_dir, custom_routing_path, default_user_agent, ensure_default_custom_routing,
-    AppState, DomainStrategy, MemoryProfile, ProxyMode, RoutingPreset, RoutingRule,
-    RuleDefaultAction, RuleMatchKind, StabilityStats, VlessNode, XrayLogLevel,
+    short_sub_host, AppState, DomainStrategy, MemoryProfile, ProxyMode, RoutingPreset, RoutingRule,
+    RuleDefaultAction, RuleMatchKind, SubscriptionProfile, VlessNode, XrayLogLevel,
 };
-use crate::ping::{extract_ping_targets, ping_all_async, stability_test_all_async};
+use crate::ping::{extract_ping_targets, ping_all_async, real_ping_all_async};
 use crate::sys_proxy::{
     browse_for_exe, disable_system_proxy, enable_system_proxy, enforce_tun_route_and_metric,
-    find_adapter_luid, flush_dns_cache, is_autostart_enabled, is_elevated,
+    find_adapter_luid, flush_dns_cache, get_clipboard_text, is_autostart_enabled, is_elevated,
     list_running_user_processes, notify_network_change, open_file_in_notepad,
     open_folder_in_explorer, query_luid_octets, relaunch_as_admin, reset_external_tcp_connections,
-    set_autostart, spawn_self_update_helper, spawn_tun_post_pnp_guard, to_wide,
+    set_autostart, set_clipboard_text, spawn_self_update_helper, spawn_tun_post_pnp_guard, to_wide,
 };
-use crate::vless::parse_subscription_body;
-use crate::xray_config::{build_xray_config, validate_remote_dns};
+use crate::vless::{is_proxy_link_text, parse_subscription_body};
+use crate::xray_config::{build_xray_config, validate_remote_dns, OutboundOpts};
 use crate::xray_proc::{XrayRunner, XrayStartOpts};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
+use std::time::{SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT,
     WPARAM,
@@ -34,8 +35,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateFontW, DeleteObject, DrawFocusRect, DrawTextW, FillRect, GetSysColor, GetSysColorBrush,
     GetViewportOrgEx, InvalidateRect, MapWindowPoints, SelectObject, SetBkMode, SetBrushOrgEx,
     SetTextColor, COLOR_BTNFACE, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
-    COLOR_WINDOWTEXT, DT_CALCRECT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC,
-    HFONT, TRANSPARENT,
+    COLOR_WINDOWTEXT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER,
+    HBRUSH, HDC, HFONT, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Threading::CreateMutexW;
@@ -48,7 +49,7 @@ use windows_sys::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, GetDpiForWindow, SetProcessDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetKeyState, SetFocus};
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW,
@@ -56,26 +57,28 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallWindowProcW, ChangeWindowMessageFilterEx, CheckMenuItem, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-    FindWindowW, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, KillTimer, LoadCursorW, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SendMessageW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu,
-    TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_AUTORADIOBUTTON, BS_GROUPBOX,
-    BS_PUSHBUTTON, CBS_AUTOHSCROLL, CBS_DROPDOWN, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
-    CB_RESETCONTENT, CB_SETCURSEL, CBN_SELCHANGE, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE,
-    ES_NUMBER, ES_READONLY, GWLP_USERDATA, GWLP_WNDPROC, HICON, HMENU, IDC_ARROW, IDYES,
+    FindWindowW, GetClientRect, GetCursorPos, GetMessageW, GetParent, GetWindowLongPtrW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsWindowVisible,
+    KillTimer, LoadCursorW,
+    MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TrackPopupMenu, TranslateMessage, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
+    BS_AUTORADIOBUTTON, BS_DEFPUSHBUTTON, BS_GROUPBOX, BS_PUSHBUTTON, CBS_AUTOHSCROLL,
+    CBS_DROPDOWN, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_RESETCONTENT, CB_SETCURSEL,
+    CBN_SELCHANGE, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_NUMBER, ES_READONLY,
+    GWLP_USERDATA, GWLP_WNDPROC, GWL_ID, HICON, HMENU, IDCANCEL, IDC_ARROW, IDOK, IDYES,
     LBN_DBLCLK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
-    LBS_OWNERDRAWFIXED, LB_ADDSTRING, LB_DELETESTRING, LB_GETCURSEL, LB_INSERTSTRING,
-    LB_ITEMFROMPOINT, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MF_BYCOMMAND, MF_CHECKED, MF_SEPARATOR,
+    LBS_OWNERDRAWFIXED, LB_ADDSTRING, LB_GETCURSEL, LB_GETITEMRECT, LB_ITEMFROMPOINT,
+    LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT, MB_ICONERROR, MB_ICONINFORMATION,
+    MB_ICONQUESTION, MB_OK, MB_YESNO, MF_BYCOMMAND, MF_CHECKED, MF_GRAYED, MF_SEPARATOR,
     MF_STRING, MF_UNCHECKED, MSG, MSGFLT_ALLOW, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE, SW_SHOW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_TOPALIGN, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ENDSESSION, WM_ERASEBKGND, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_NOTIFY, WM_POWERBROADCAST, WM_PRINTCLIENT,
-    WM_RBUTTONUP, WM_SETFONT, WM_SETICON, WM_TIMER, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CAPTION,
-    WS_CHILD, WS_EX_CLIENTEDGE, WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_SYSMENU, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ENDSESSION, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_NOTIFY, WM_POWERBROADCAST,
+    WM_PRINTCLIENT, WM_RBUTTONUP, WM_SETFONT, WM_SETICON, WM_TIMER, WNDCLASSEXW, WNDPROC,
+    WS_BORDER, WS_CAPTION, WS_CHILD, WS_EX_CLIENTEDGE, WS_GROUP, WS_MINIMIZEBOX, WS_OVERLAPPED,
+    WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 static ORIG_LISTBOX_PROC: AtomicUsize = AtomicUsize::new(0);
@@ -93,9 +96,13 @@ const SS_SUNKEN: u32 = 0x0000_1000;
 const WM_TRAYICON: u32 = WM_APP + 1;
 const WM_UI_EVENT: u32 = WM_APP + 2;
 const WM_SHOW_EXISTING: u32 = WM_APP + 3;
+const WM_NODE_CTXMENU: u32 = WM_APP + 4;
 
 const TIMER_RESUME_RECONNECT: usize = 101;
 const TIMER_STATS: usize = 102;
+const TIMER_SUB_AUTO: usize = 103;
+const TIMER_SUB_INIT: usize = 104;
+const TIMER_UPDATE_CHECK: usize = 105;
 
 // Control IDs
 const ID_TAB_MAIN: usize = 1000;
@@ -116,9 +123,11 @@ const ID_BTN_ELEVATE: usize = 1016;
 const ID_LBL_STATUS: usize = 1017;
 const ID_EDIT_LOG: usize = 1018;
 const ID_BTN_CLEAR_LOG: usize = 1019;
-const ID_BTN_STABILITY: usize = 1021;
 const ID_CHK_KILLSWITCH: usize = 1022;
 const ID_BTN_OPEN_ROUTING: usize = 1023;
+const ID_BTN_SUB_ADD: usize = 1024;
+const ID_BTN_SUB_DEL: usize = 1025;
+const ID_BTN_REAL_PING: usize = 1026;
 
 // Routing tab (Tab 2) Control IDs
 const ID_COMBO_DEFAULT: usize = 1101;
@@ -158,6 +167,10 @@ const ID_BTN_SETTINGS_APPLY: usize = 1217;
 const ID_BTN_CHECK_UPDATE: usize = 1218;
 const ID_LBL_UPDATE_INFO: usize = 1219;
 const ID_LBL_VERSION: usize = 1220;
+const ID_CHK_FRAGMENT: usize = 1221;
+const ID_CHK_NOISE: usize = 1222;
+const ID_CHK_MUX: usize = 1223;
+const ID_CHK_HWID: usize = 1224;
 
 // Tray menu IDs
 const ID_TRAY_SHOW: usize = 2001;
@@ -166,16 +179,39 @@ const ID_TRAY_MODE_PROXY: usize = 2003;
 const ID_TRAY_MODE_TUN: usize = 2004;
 const ID_TRAY_EXIT: usize = 2005;
 
+// Server list context menu IDs
+const ID_CTX_CONNECT: usize = 2101;
+const ID_CTX_TCP_PING: usize = 2102;
+const ID_CTX_REAL_PING: usize = 2103;
+const ID_CTX_IMPORT_CLIP: usize = 2104;
+const ID_CTX_COPY_URI: usize = 2105;
+const ID_CTX_RENAME: usize = 2106;
+const ID_CTX_EDIT: usize = 2107;
+const ID_CTX_REMOVE: usize = 2108;
+
+struct SubFetchOutcome {
+    nodes: Vec<VlessNode>,
+    resp: SubscriptionResponse,
+}
+
 enum UiEvent {
     LogLine(String),
-    SubFetched(Result<Vec<VlessNode>, String>),
-    PingResult(usize, u32),
-    PingFinished,
-    StabilityResult(u32, usize, StabilityStats),
-    StabilityFinished(u32),
-    LivePingUpdate(u32, LivePingStats),
+    SubFetched {
+        sub_id: String,
+        url: String,
+        silent: bool,
+        res: Result<SubFetchOutcome, String>,
+    },
+    PingResult(u32, usize, u32),
+    PingFinished(u32),
+    RealPingResult(u32, usize, u32),
+    RealPingError(u32, String),
+    RealPingFinished(u32),
     GeoUpdated(Result<(usize, usize), String>),
-    UpdateChecked(Result<ReleaseInfo, String>),
+    UpdateChecked {
+        silent: bool,
+        res: Result<ReleaseInfo, String>,
+    },
     UpdateDownloaded(Result<PathBuf, String>),
     XrayExited(u32),
 }
@@ -197,11 +233,15 @@ struct AppContext {
     stats_base: Option<(u64, u64)>,
     stats_prev: Option<(u64, u64)>,
     last_traffic: Option<String>,
-    live_ping: Option<LivePingStats>,
-    live_ping_stop: Option<Arc<AtomicBool>>,
-    live_ping_gen: u32,
-    stability_cancel: Option<Arc<AtomicBool>>,
-    stability_gen: u32,
+    sub_fetching: bool,
+    active_sub_id: Option<String>,
+    sub_combo_ids: Vec<String>,
+    sub_retry_after: HashMap<String, u64>,
+    ping_gen: u32,
+    real_ping_cancel: Option<Arc<AtomicBool>>,
+    real_ping_gen: u32,
+    update_checking: bool,
+    pending_update: Option<ReleaseInfo>,
 
     // Top tab strip & per-tab visibility groups
     h_tab: HWND,
@@ -214,7 +254,7 @@ struct AppContext {
     h_btn_fetch: HWND,
     h_list_nodes: HWND,
     h_btn_ping: HWND,
-    h_btn_stability: HWND,
+    h_btn_real_ping: HWND,
     h_lbl_count: HWND,
     h_btn_toggle: HWND,
     h_radio_proxy: HWND,
@@ -245,9 +285,13 @@ struct AppContext {
     h_combo_loglevel: HWND,
     h_combo_strategy: HWND,
     h_combo_mem: HWND,
+    h_chk_fragment: HWND,
+    h_chk_noise: HWND,
+    h_chk_mux: HWND,
     h_edit_ua: HWND,
     h_chk_autoconnect: HWND,
     h_chk_start_min: HWND,
+    h_chk_hwid: HWND,
     h_btn_update_geo: HWND,
     h_lbl_geo_info: HWND,
     h_btn_check_update: HWND,
@@ -424,11 +468,15 @@ pub fn run_app(start_minimized: bool, autoconnect: bool) {
             stats_base: None,
             stats_prev: None,
             last_traffic: None,
-            live_ping: None,
-            live_ping_stop: None,
-            live_ping_gen: 0,
-            stability_cancel: None,
-            stability_gen: 0,
+            sub_fetching: false,
+            active_sub_id: None,
+            sub_combo_ids: Vec::new(),
+            sub_retry_after: HashMap::new(),
+            ping_gen: 0,
+            real_ping_cancel: None,
+            real_ping_gen: 0,
+            update_checking: false,
+            pending_update: None,
             h_tab: null_mut(),
             tab0_ctrls: Vec::new(),
             tab1_ctrls: Vec::new(),
@@ -437,7 +485,7 @@ pub fn run_app(start_minimized: bool, autoconnect: bool) {
             h_btn_fetch: null_mut(),
             h_list_nodes: null_mut(),
             h_btn_ping: null_mut(),
-            h_btn_stability: null_mut(),
+            h_btn_real_ping: null_mut(),
             h_lbl_count: null_mut(),
             h_btn_toggle: null_mut(),
             h_radio_proxy: null_mut(),
@@ -464,9 +512,13 @@ pub fn run_app(start_minimized: bool, autoconnect: bool) {
             h_combo_loglevel: null_mut(),
             h_combo_strategy: null_mut(),
             h_combo_mem: null_mut(),
+            h_chk_fragment: null_mut(),
+            h_chk_noise: null_mut(),
+            h_chk_mux: null_mut(),
             h_edit_ua: null_mut(),
             h_chk_autoconnect: null_mut(),
             h_chk_start_min: null_mut(),
+            h_chk_hwid: null_mut(),
             h_btn_update_geo: null_mut(),
             h_lbl_geo_info: null_mut(),
             h_btn_check_update: null_mut(),
@@ -502,6 +554,10 @@ pub fn run_app(start_minimized: bool, autoconnect: bool) {
 
         let ctx_ptr = Box::into_raw(ctx);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, ctx_ptr as isize);
+        // Periodic lightweight subscription auto-update timer (checks every 5 min; 0% idle load)
+        SetTimer(hwnd, TIMER_SUB_AUTO, 300_000, None);
+        SetTimer(hwnd, TIMER_SUB_INIT, 8_000, None);
+        SetTimer(hwnd, TIMER_UPDATE_CHECK, 12_000, None);
 
         if effective_minimized {
             ShowWindow(hwnd, SW_HIDE);
@@ -564,10 +620,25 @@ impl AppContext {
             h
         };
 
-        // 1. Subscription group (plain full-width URL input + Update)
-        t0(mk_ctrl(p, h_inst, "BUTTON", "Subscription (URL or vless:// / trojan:// / ss://)", WS_CHILD | WS_VISIBLE | BS_GROUPBOX as u32, 0, s(12), s(38), s(576), s(52), 0, f));
-        self.h_edit_sub = t0(mk_ctrl(p, h_inst, "EDIT", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, s(22), s(56), s(452), s(22), ID_EDIT_SUB, f));
-        self.h_btn_fetch = t0(mk_ctrl(p, h_inst, "BUTTON", "Update", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(482), s(55), s(96), s(24), ID_BTN_FETCH, f));
+        // 1. Subscription group (multi-subscription dropdown + Update / Add / Del)
+        t0(mk_ctrl(p, h_inst, "BUTTON", "Subscription", WS_CHILD | WS_VISIBLE | BS_GROUPBOX as u32, 0, s(12), s(38), s(576), s(52), 0, f));
+        self.h_edit_sub = t0(mk_ctrl(
+            p,
+            h_inst,
+            "COMBOBOX",
+            "",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN as u32 | CBS_AUTOHSCROLL as u32,
+            0,
+            s(22),
+            s(55),
+            s(374),
+            s(160),
+            ID_EDIT_SUB,
+            f,
+        ));
+        self.h_btn_fetch = t0(mk_ctrl(p, h_inst, "BUTTON", "Update", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(402), s(55), s(68), s(24), ID_BTN_FETCH, f));
+        t0(mk_ctrl(p, h_inst, "BUTTON", "Add", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(474), s(55), s(52), s(24), ID_BTN_SUB_ADD, f));
+        t0(mk_ctrl(p, h_inst, "BUTTON", "Del", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(530), s(55), s(48), s(24), ID_BTN_SUB_DEL, f));
 
         // 2. Servers group
         t0(mk_ctrl(p, h_inst, "BUTTON", "Servers (double-click to connect)", WS_CHILD | WS_VISIBLE | BS_GROUPBOX as u32, 0, s(12), s(96), s(576), s(192), 0, f));
@@ -595,10 +666,10 @@ impl AppContext {
         ));
         SendMessageW(self.h_list_nodes, LB_SETITEMHEIGHT, 0, s(18) as LPARAM);
         subclass_listbox_empty_deselect(self.h_list_nodes);
-        self.h_btn_ping = t0(mk_ctrl(p, h_inst, "BUTTON", "Ping All", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(22), s(256), s(96), s(24), ID_BTN_PING, f));
-        self.h_btn_stability = t0(mk_ctrl(p, h_inst, "BUTTON", "Stability", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(126), s(256), s(96), s(24), ID_BTN_STABILITY, f));
-        t0(mk_ctrl(p, h_inst, "BUTTON", "Remove", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(230), s(256), s(88), s(24), ID_BTN_DEL, f));
-        self.h_lbl_count = t0(mk_ctrl(p, h_inst, "STATIC", "Servers: 0", WS_CHILD | WS_VISIBLE, 0, s(330), s(260), s(248), s(18), ID_LBL_COUNT, f));
+        self.h_btn_ping = t0(mk_ctrl(p, h_inst, "BUTTON", "TCP Ping", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(22), s(256), s(80), s(24), ID_BTN_PING, f));
+        self.h_btn_real_ping = t0(mk_ctrl(p, h_inst, "BUTTON", "Real Ping", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(108), s(256), s(82), s(24), ID_BTN_REAL_PING, f));
+        t0(mk_ctrl(p, h_inst, "BUTTON", "Remove", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(196), s(256), s(72), s(24), ID_BTN_DEL, f));
+        self.h_lbl_count = t0(mk_ctrl(p, h_inst, "STATIC", "Status: Disconnected", WS_CHILD | WS_VISIBLE, 0, s(280), s(260), s(298), s(18), ID_LBL_COUNT, f));
 
         // 3. Connection & Routing group (double && escapes Win32 mnemonic underscore)
         t0(mk_ctrl(p, h_inst, "BUTTON", "Connection && Routing", WS_CHILD | WS_VISIBLE | BS_GROUPBOX as u32, 0, s(12), s(294), s(576), s(106), 0, f));
@@ -801,15 +872,18 @@ impl AppContext {
             let w = to_wide(item);
             SendMessageW(self.h_combo_mem, CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
         }
-        t2(mk_ctrl(p, h_inst, "STATIC", "Set Log Level to 'info' to inspect per-domain/process routing in Xray Log.", WS_CHILD, 0, s(22), s(280), s(556), s(18), 0, f));
+        self.h_chk_fragment = t2(mk_ctrl(p, h_inst, "BUTTON", "TLS Fragment", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(22), s(278), s(140), s(20), ID_CHK_FRAGMENT, f));
+        self.h_chk_noise = t2(mk_ctrl(p, h_inst, "BUTTON", "UDP Noise", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(176), s(278), s(130), s(20), ID_CHK_NOISE, f));
+        self.h_chk_mux = t2(mk_ctrl(p, h_inst, "BUTTON", "Mux (XUDP)", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(320), s(278), s(140), s(20), ID_CHK_MUX, f));
 
         // 3. App & Tools group
         t2(mk_ctrl(p, h_inst, "BUTTON", "App && Tools", WS_CHILD | BS_GROUPBOX as u32, 0, s(12), s(314), s(576), s(164), 0, f));
         t2(mk_ctrl(p, h_inst, "STATIC", "User-Agent:", WS_CHILD, 0, s(22), s(339), s(96), s(18), 0, f));
         self.h_edit_ua = t2(mk_ctrl(p, h_inst, "EDIT", "", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, s(122), s(336), s(456), s(22), ID_EDIT_UA, f));
 
-        self.h_chk_autoconnect = t2(mk_ctrl(p, h_inst, "BUTTON", "Auto-connect on launch", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(22), s(370), s(196), s(20), ID_CHK_AUTOCONNECT, f));
-        self.h_chk_start_min = t2(mk_ctrl(p, h_inst, "BUTTON", "Start minimized to tray", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(230), s(370), s(200), s(20), ID_CHK_START_MIN, f));
+        self.h_chk_autoconnect = t2(mk_ctrl(p, h_inst, "BUTTON", "Auto-connect on launch", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(22), s(370), s(176), s(20), ID_CHK_AUTOCONNECT, f));
+        self.h_chk_start_min = t2(mk_ctrl(p, h_inst, "BUTTON", "Start minimized to tray", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(204), s(370), s(172), s(20), ID_CHK_START_MIN, f));
+        self.h_chk_hwid = t2(mk_ctrl(p, h_inst, "BUTTON", "Send HWID headers", WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX as u32, 0, s(382), s(370), s(192), s(20), ID_CHK_HWID, f));
 
         self.h_btn_update_geo = t2(mk_ctrl(p, h_inst, "BUTTON", "Update GeoIP / GeoSite", WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(22), s(402), s(172), s(26), ID_BTN_UPDATE_GEO, f));
         self.h_lbl_geo_info = t2(mk_ctrl(p, h_inst, "STATIC", "", WS_CHILD, 0, s(206), s(406), s(370), s(18), ID_LBL_GEO_INFO, f));
@@ -1093,6 +1167,24 @@ impl AppContext {
             self.state.memory_profile.to_index() as WPARAM,
             0,
         );
+        SendMessageW(
+            self.h_chk_fragment,
+            BM_SETCHECK,
+            if self.state.enable_fragment { 1 } else { 0 },
+            0,
+        );
+        SendMessageW(
+            self.h_chk_noise,
+            BM_SETCHECK,
+            if self.state.enable_noise { 1 } else { 0 },
+            0,
+        );
+        SendMessageW(
+            self.h_chk_mux,
+            BM_SETCHECK,
+            if self.state.enable_mux { 1 } else { 0 },
+            0,
+        );
         set_text(self.h_edit_ua, &self.state.user_agent);
         SendMessageW(
             self.h_chk_autoconnect,
@@ -1104,6 +1196,12 @@ impl AppContext {
             self.h_chk_start_min,
             BM_SETCHECK,
             if self.state.start_minimized { 1 } else { 0 },
+            0,
+        );
+        SendMessageW(
+            self.h_chk_hwid,
+            BM_SETCHECK,
+            if self.state.send_hwid { 1 } else { 0 },
             0,
         );
         self.refresh_geo_info_label();
@@ -1172,6 +1270,9 @@ impl AppContext {
         );
         let memory_profile =
             MemoryProfile::from_index(SendMessageW(self.h_combo_mem, CB_GETCURSEL, 0, 0) as i32);
+        let enable_fragment = SendMessageW(self.h_chk_fragment, BM_GETCHECK, 0, 0) != 0;
+        let enable_noise = SendMessageW(self.h_chk_noise, BM_GETCHECK, 0, 0) != 0;
+        let enable_mux = SendMessageW(self.h_chk_mux, BM_GETCHECK, 0, 0) != 0;
         let ua_raw = get_text(self.h_edit_ua).trim().to_string();
         let user_agent = if ua_raw.is_empty() {
             default_user_agent()
@@ -1181,6 +1282,7 @@ impl AppContext {
         let auto_connect_on_launch =
             SendMessageW(self.h_chk_autoconnect, BM_GETCHECK, 0, 0) != 0;
         let start_minimized = SendMessageW(self.h_chk_start_min, BM_GETCHECK, 0, 0) != 0;
+        let send_hwid = SendMessageW(self.h_chk_hwid, BM_GETCHECK, 0, 0) != 0;
 
         let core_changed = self.state.tun_mtu != mtu
             || self.state.socks_port != socks_port
@@ -1190,7 +1292,10 @@ impl AppContext {
             || self.state.remote_dns != remote_dns
             || self.state.log_level != log_level
             || self.state.domain_strategy != domain_strategy
-            || self.state.memory_profile != memory_profile;
+            || self.state.memory_profile != memory_profile
+            || self.state.enable_fragment != enable_fragment
+            || self.state.enable_noise != enable_noise
+            || self.state.enable_mux != enable_mux;
 
         self.state.tun_mtu = mtu;
         self.state.socks_port = socks_port;
@@ -1201,9 +1306,13 @@ impl AppContext {
         self.state.log_level = log_level;
         self.state.domain_strategy = domain_strategy;
         self.state.memory_profile = memory_profile;
+        self.state.enable_fragment = enable_fragment;
+        self.state.enable_noise = enable_noise;
+        self.state.enable_mux = enable_mux;
         self.state.user_agent = user_agent;
         self.state.auto_connect_on_launch = auto_connect_on_launch;
         self.state.start_minimized = start_minimized;
+        self.state.send_hwid = send_hwid;
 
         let _ = self.state.save();
         self.sync_settings_controls();
@@ -1260,19 +1369,55 @@ impl AppContext {
     }
 
     unsafe fn on_check_updates(&mut self) {
-        EnableWindow(self.h_btn_check_update, 0);
-        set_text(self.h_btn_check_update, "Checking...");
-        set_text(self.h_lbl_update_info, "Checking GitHub releases...");
-        self.append_log("Checking GitHub for updates...");
+        self.start_update_check(false);
+    }
+
+    unsafe fn start_update_check(&mut self, silent: bool) {
+        if self.update_checking {
+            return;
+        }
+        if silent && now_unix().saturating_sub(self.state.last_update_check_unix) < 86_400 {
+            return;
+        }
+        self.update_checking = true;
+        if !silent {
+            EnableWindow(self.h_btn_check_update, 0);
+            set_text(self.h_btn_check_update, "Checking...");
+            set_text(self.h_lbl_update_info, "Checking GitHub releases...");
+            self.append_log("Checking GitHub for updates...");
+        }
 
         let ua = self.state.user_agent.clone();
         let tx = self.ev_tx.clone();
         let hwnd_raw = self.hwnd as usize;
         std::thread::spawn(move || {
             let res = check_latest_release(&ua);
-            let _ = tx.send(UiEvent::UpdateChecked(res));
+            let _ = tx.send(UiEvent::UpdateChecked { silent, res });
             PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
         });
+    }
+
+    unsafe fn prompt_update_dialog(&mut self, rel: ReleaseInfo) {
+        let prompt = format!(
+            "New version {} is available (current: v{}).\n\nDownload, verify SHA256, and restart now?",
+            rel.tag, APP_VERSION
+        );
+        if msg_box(
+            self.hwnd,
+            &prompt,
+            "Update Available",
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+        {
+            self.start_update_download(rel);
+        }
+    }
+
+    unsafe fn prompt_pending_update_if_any(&mut self) {
+        if let Some(rel) = self.pending_update.take() {
+            self.update_status_and_tray();
+            self.prompt_update_dialog(rel);
+        }
     }
 
     unsafe fn start_update_download(&mut self, rel: ReleaseInfo) {
@@ -1299,8 +1444,7 @@ impl AppContext {
     }
 
     unsafe fn sync_ui_from_state(&mut self) {
-        set_text(self.h_edit_sub, &self.state.subscription_url);
-
+        self.rebuild_sub_combo();
         self.rebuild_node_list();
         self.rebuild_rule_list(Some(0));
         self.sync_settings_controls();
@@ -1351,6 +1495,36 @@ impl AppContext {
         self.update_status_and_tray();
     }
 
+    unsafe fn rebuild_sub_combo(&mut self) {
+        if self.h_edit_sub.is_null() {
+            return;
+        }
+        SendMessageW(self.h_edit_sub, CB_RESETCONTENT, 0, 0);
+        self.sub_combo_ids.clear();
+        for sub in &self.state.subscriptions {
+            let label = sub_combo_label(sub);
+            let w = to_wide(&label);
+            SendMessageW(self.h_edit_sub, CB_ADDSTRING, 0, w.as_ptr() as LPARAM);
+            self.sub_combo_ids.push(sub.id.clone());
+        }
+        if self.state.subscriptions.is_empty() {
+            self.active_sub_id = None;
+            set_text(self.h_edit_sub, &self.state.subscription_url);
+            return;
+        }
+        let target_idx = self
+            .active_sub_id
+            .as_deref()
+            .and_then(|id| self.sub_combo_ids.iter().position(|x| x == id))
+            .or_else(|| {
+                let u = self.state.subscription_url.trim();
+                self.state.subscriptions.iter().position(|s| s.url == u)
+            })
+            .unwrap_or(0);
+        self.active_sub_id = Some(self.sub_combo_ids[target_idx].clone());
+        SendMessageW(self.h_edit_sub, CB_SETCURSEL, target_idx, 0);
+    }
+
     unsafe fn sync_state_from_controls(&mut self) {
         if !self.h_combo_route.is_null() {
             let r_idx = SendMessageW(self.h_combo_route, CB_GETCURSEL, 0, 0) as i32;
@@ -1367,6 +1541,10 @@ impl AppContext {
     }
 
     unsafe fn rebuild_node_list(&mut self) {
+        self.rebuild_node_list_with_sel(true);
+    }
+
+    unsafe fn rebuild_node_list_with_sel(&mut self, select_item: bool) {
         SendMessageW(self.h_list_nodes, LB_RESETCONTENT, 0, 0);
         for node in &self.state.nodes {
             let row = to_wide(&node.display_row());
@@ -1375,54 +1553,69 @@ impl AppContext {
         if !self.state.nodes.is_empty() {
             let idx = self.state.selected_index.min(self.state.nodes.len() - 1);
             self.state.selected_index = idx;
-            SendMessageW(self.h_list_nodes, LB_SETCURSEL, idx, 0);
+            if select_item {
+                SendMessageW(self.h_list_nodes, LB_SETCURSEL, idx, 0);
+            }
+        } else {
+            self.state.selected_index = 0;
         }
-        set_text(self.h_lbl_count, &format!("Servers: {}", self.state.nodes.len()));
         self.rebuild_rule_target_combo();
     }
 
     unsafe fn update_single_node_row(&self, idx: usize) {
-        if let Some(node) = self.state.nodes.get(idx) {
-            let cur_sel = SendMessageW(self.h_list_nodes, LB_GETCURSEL, 0, 0);
-            SendMessageW(self.h_list_nodes, LB_DELETESTRING, idx, 0);
-            let row = to_wide(&node.display_row());
-            SendMessageW(self.h_list_nodes, LB_INSERTSTRING, idx, row.as_ptr() as LPARAM);
-            if cur_sel >= 0 {
-                SendMessageW(self.h_list_nodes, LB_SETCURSEL, cur_sel as WPARAM, 0);
-            }
+        if idx >= self.state.nodes.len() || self.h_list_nodes.is_null() {
+            return;
+        }
+        let mut rc: RECT = std::mem::zeroed();
+        let ok = SendMessageW(
+            self.h_list_nodes,
+            LB_GETITEMRECT,
+            idx,
+            &mut rc as *mut RECT as LPARAM,
+        );
+        if ok >= 0 {
+            InvalidateRect(self.h_list_nodes, &rc, 0);
+        } else {
+            InvalidateRect(self.h_list_nodes, null(), 0);
         }
     }
 
     unsafe fn update_status_and_tray(&mut self) {
-        let status_str = if self.connected {
-            let ping_part = match self.live_ping {
-                Some(lp) => lp.format_status(),
-                None => "ping...".to_string(),
-            };
+        let bar_str = if self.connected {
             if self.state.mode == ProxyMode::Tun {
                 if let Some(ref tr) = self.last_traffic {
-                    format!(" Connected - {} - {}", ping_part, tr)
+                    format!(" {}", tr)
                 } else {
-                    format!(" Connected - {}", ping_part)
+                    " TUN (avel0)".to_string()
                 }
             } else {
-                format!(
-                    " Connected - {} - SOCKS {} / HTTP {}",
-                    ping_part, self.state.socks_port, self.state.http_port
-                )
+                format!(" SOCKS {} / HTTP {}", self.state.socks_port, self.state.http_port)
             }
         } else {
-            format!(
-                " Disconnected ({})",
-                if self.is_admin { "Admin" } else { "User" }
-            )
+            String::new()
         };
-        set_text(self.h_lbl_status, &status_str);
+        let mut tray_str = if self.connected {
+            format!("avel-xray - Connected{}", if bar_str.is_empty() { String::new() } else { format!(" -{}", bar_str) })
+        } else {
+            "avel-xray - Disconnected".to_string()
+        };
+        if let Some(ref rel) = self.pending_update {
+            tray_str.push_str(&format!(" (Update {})", rel.tag));
+        }
+        set_text(
+            self.h_lbl_count,
+            if self.connected {
+                "Status: Connected"
+            } else {
+                "Status: Disconnected"
+            },
+        );
+        set_text(self.h_lbl_status, &bar_str);
         set_text(
             self.h_btn_toggle,
             if self.connected { "Disconnect" } else { "Connect" },
         );
-        self.modify_tray_tip(&format!("avel-xray - {}", status_str.trim()));
+        self.modify_tray_tip(&tray_str);
     }
 
     unsafe fn on_stats_tick(&mut self) {
@@ -1452,29 +1645,8 @@ impl AppContext {
         self.update_status_and_tray();
     }
 
-    fn stop_live_monitor(&mut self) {
-        if let Some(flag) = self.live_ping_stop.take() {
-            flag.store(true, Ordering::Relaxed);
-        }
-        self.live_ping_gen = self.live_ping_gen.wrapping_add(1);
-        self.live_ping = None;
+    fn clear_traffic_stats(&mut self) {
         self.last_traffic = None;
-    }
-
-    fn start_live_monitor(&mut self) {
-        self.stop_live_monitor();
-        let gen = self.live_ping_gen;
-        let stop = Arc::new(AtomicBool::new(false));
-        self.live_ping_stop = Some(stop.clone());
-        let port = self.state.http_port;
-        let tx = self.ev_tx.clone();
-        let hwnd_raw = self.hwnd as usize;
-        spawn_live_tunnel_monitor(port, stop, move |stats| {
-            let _ = tx.send(UiEvent::LivePingUpdate(gen, stats));
-            unsafe {
-                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
-            }
-        });
     }
 
     unsafe fn add_tray_icon(&mut self) {
@@ -1532,83 +1704,386 @@ impl AppContext {
         SendMessageW(self.h_edit_log, 0x00B7, 0, 0);
     }
 
+    fn find_subscription_from_input(&self, input: &str) -> Option<&SubscriptionProfile> {
+        let t = input.trim();
+        if t.is_empty() {
+            return None;
+        }
+        self.state
+            .subscriptions
+            .iter()
+            .find(|s| s.url == t || sub_combo_label(s) == t)
+    }
+
+    unsafe fn start_subscription_fetch(
+        &mut self,
+        url: String,
+        sub_id_opt: Option<String>,
+        silent: bool,
+    ) {
+        if self.sub_fetching {
+            if !silent {
+                self.append_log("Subscription update is already running.");
+            }
+            return;
+        }
+        let sub_id = sub_id_opt
+            .or_else(|| {
+                self.state
+                    .subscriptions
+                    .iter()
+                    .find(|s| s.url == url)
+                    .map(|s| s.id.clone())
+            })
+            .unwrap_or_else(|| self.state.next_subscription_id());
+
+        self.sub_fetching = true;
+        EnableWindow(self.h_btn_fetch, 0);
+        set_text(self.h_btn_fetch, "Loading...");
+        if silent {
+            self.append_log(&format!(
+                "Auto-updating subscription ({})...",
+                short_sub_host(&url)
+            ));
+        } else if url.starts_with("http://") {
+            self.append_log("WARNING: Fetching subscription over unencrypted HTTP.");
+        } else {
+            self.append_log(&format!(
+                "Fetching subscription ({})...",
+                short_sub_host(&url)
+            ));
+        }
+
+        let tx = self.ev_tx.clone();
+        let ua = self.state.user_agent.clone();
+        let send_hwid = self.state.send_hwid;
+        let fallback_proxy_port = if self.connected {
+            Some(self.state.http_port)
+        } else {
+            None
+        };
+        let hwnd_raw = self.hwnd as usize;
+        std::thread::spawn(move || {
+            let res = fetch_subscription_opts(&url, &ua, send_hwid, fallback_proxy_port).and_then(
+                |resp| {
+                    let nodes = parse_subscription_body(&resp.body)?;
+                    if nodes.is_empty() {
+                        return Err(
+                            "No supported proxy links found in subscription response.".to_string()
+                        );
+                    }
+                    Ok(SubFetchOutcome { nodes, resp })
+                },
+            );
+            let _ = tx.send(UiEvent::SubFetched {
+                sub_id,
+                url,
+                silent,
+                res,
+            });
+            PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+        });
+    }
+
+    unsafe fn import_proxy_links(&mut self, text: &str, source: &str, show_errors: bool) -> bool {
+        let parsed = match parse_subscription_body(text) {
+            Ok(n) if !n.is_empty() => n,
+            Ok(_) => {
+                if show_errors {
+                    msg_box(
+                        self.hwnd,
+                        "No supported proxy links found (vless://, vmess://, trojan://, ss://, hy2://, wireguard://, socks5://, http://).",
+                        "Import",
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+                return false;
+            }
+            Err(e) => {
+                if show_errors {
+                    msg_box(self.hwnd, &e, "Import Error", MB_OK | MB_ICONERROR);
+                }
+                return false;
+            }
+        };
+
+        let first_new_idx = self.state.nodes.len();
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        for mut node in parsed {
+            node.source_sub_id = None;
+            let dup = self.state.nodes.iter().any(|ex| {
+                ex.protocol == node.protocol
+                    && ex.address == node.address
+                    && ex.port == node.port
+                    && ex.uuid == node.uuid
+                    && ex.sni == node.sni
+                    && ex.path == node.path
+                    && ex.service_name == node.service_name
+            });
+            if dup {
+                skipped += 1;
+            } else {
+                self.state.nodes.push(node);
+                added += 1;
+            }
+        }
+
+        if added > 0 {
+            self.cancel_real_ping();
+            self.ping_gen = self.ping_gen.wrapping_add(1);
+            self.state.selected_index = first_new_idx;
+            let _ = self.state.save();
+            self.rebuild_node_list();
+            if skipped > 0 {
+                self.append_log(&format!(
+                    "Added {} server(s) from {} ({} duplicate skipped).",
+                    added, source, skipped
+                ));
+            } else {
+                self.append_log(&format!("Added {} server(s) from {}.", added, source));
+            }
+            true
+        } else {
+            self.append_log(&format!(
+                "No new servers added from {} ({} duplicate already in list).",
+                source, skipped
+            ));
+            true
+        }
+    }
+
     unsafe fn on_fetch_subscription(&mut self) {
         let input = get_text(self.h_edit_sub).trim().to_string();
         if input.is_empty() {
             msg_box(
                 self.hwnd,
-                "Enter a subscription URL or vless:// link first.",
+                "Enter a subscription URL or proxy link first.",
                 "Subscription",
                 MB_OK | MB_ICONINFORMATION,
             );
             return;
         }
-        self.state.subscription_url = input.clone();
-        let _ = self.state.save();
 
-        if (input.contains("vless://")
-            || input.contains("trojan://")
-            || input.contains("ss://"))
-            && !input.starts_with("http://")
-            && !input.starts_with("https://")
-        {
-            let nodes = match parse_subscription_body(&input) {
-                Ok(n) if !n.is_empty() => n,
-                Ok(_) => {
-                    msg_box(
-                        self.hwnd,
-                        "Failed to parse proxy link (vless://, trojan://, ss://).",
-                        "Error",
-                        MB_OK | MB_ICONERROR,
-                    );
-                    return;
-                }
-                Err(e) => {
-                    msg_box(self.hwnd, &e, "Error", MB_OK | MB_ICONERROR);
-                    return;
-                }
-            };
-            self.state.nodes = nodes;
-            self.state.selected_index = 0;
-            let _ = self.state.save();
-            self.rebuild_node_list();
-            self.append_log(&format!("Loaded {} server(s) from text.", self.state.nodes.len()));
+        if is_proxy_link_text(&input) {
+            self.import_proxy_links(&input, "input", true);
+            self.rebuild_sub_combo();
             return;
         }
 
-        EnableWindow(self.h_btn_fetch, 0);
-        set_text(self.h_btn_fetch, "Loading...");
-        if input.starts_with("http://") {
-            self.append_log("WARNING: Fetching subscription over unencrypted HTTP.");
-        } else {
-            self.append_log("Fetching subscription via WinHTTP...");
+        if let Some(sub) = self.find_subscription_from_input(&input) {
+            let url = sub.url.clone();
+            let id = sub.id.clone();
+            self.start_subscription_fetch(url, Some(id), false);
+            return;
         }
 
-        let tx = self.ev_tx.clone();
-        let ua = self.state.user_agent.clone();
-        let hwnd_raw = self.hwnd as usize;
-        std::thread::spawn(move || {
-            let res = fetch_subscription(&input, &ua).and_then(|resp| {
-                let nodes = parse_subscription_body(&resp.body)?;
-                if nodes.is_empty() {
-                    return Err("No vless://, trojan://, or ss:// links found in subscription response.".to_string());
+        if input.starts_with("http://") || input.starts_with("https://") {
+            self.start_subscription_fetch(input, None, false);
+            return;
+        }
+
+        if self.import_proxy_links(&input, "input", false) {
+            self.rebuild_sub_combo();
+            return;
+        }
+
+        msg_box(
+            self.hwnd,
+            "Enter an http(s):// subscription URL or a supported proxy link.",
+            "Subscription",
+            MB_OK | MB_ICONERROR,
+        );
+    }
+
+    unsafe fn on_add_nodes_action(&mut self) {
+        let input = get_text(self.h_edit_sub).trim().to_string();
+        if is_proxy_link_text(&input) {
+            self.import_proxy_links(&input, "input", true);
+            self.rebuild_sub_combo();
+            return;
+        }
+        if (input.starts_with("http://") || input.starts_with("https://"))
+            && !self.state.subscriptions.iter().any(|s| s.url == input)
+        {
+            self.start_subscription_fetch(input, None, false);
+            return;
+        }
+
+        if let Some(clip_raw) = get_clipboard_text(self.hwnd) {
+            let clip = clip_raw.trim().to_string();
+            if !clip.is_empty() {
+                if !is_proxy_link_text(&clip)
+                    && (clip.starts_with("http://") || clip.starts_with("https://"))
+                    && !clip.contains('\n')
+                    && !clip.contains('\r')
+                {
+                    let existing_id = self
+                        .state
+                        .subscriptions
+                        .iter()
+                        .find(|s| s.url == clip)
+                        .map(|s| s.id.clone());
+                    self.start_subscription_fetch(clip, existing_id, false);
+                    return;
                 }
-                Ok(nodes)
-            });
-            let _ = tx.send(UiEvent::SubFetched(res));
-            PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+                if self.import_proxy_links(&clip, "clipboard", false) {
+                    return;
+                }
+            }
+        }
+
+        msg_box(
+            self.hwnd,
+            "Paste a new subscription URL or proxy link into the Subscription field, or copy it to the clipboard and click Add (or press Ctrl+V in Servers).",
+            "Add Subscription / Server",
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+
+    unsafe fn on_import_from_clipboard(&mut self) {
+        let Some(clip_raw) = get_clipboard_text(self.hwnd) else {
+            self.append_log("Clipboard does not contain text.");
+            return;
+        };
+        let clip = clip_raw.trim().to_string();
+        if clip.is_empty() {
+            self.append_log("Clipboard is empty.");
+            return;
+        }
+        if !is_proxy_link_text(&clip)
+            && (clip.starts_with("http://") || clip.starts_with("https://"))
+            && !clip.contains('\n')
+            && !clip.contains('\r')
+        {
+            let existing_id = self
+                .state
+                .subscriptions
+                .iter()
+                .find(|s| s.url == clip)
+                .map(|s| s.id.clone());
+            self.start_subscription_fetch(clip, existing_id, false);
+            return;
+        }
+        self.import_proxy_links(&clip, "clipboard", true);
+    }
+
+    unsafe fn on_delete_subscription(&mut self) {
+        let input = get_text(self.h_edit_sub).trim().to_string();
+        let target = self
+            .find_subscription_from_input(&input)
+            .or_else(|| {
+                self.active_sub_id
+                    .as_deref()
+                    .and_then(|id| self.state.subscriptions.iter().find(|s| s.id == id))
+            })
+            .cloned();
+
+        let Some(sub) = target else {
+            msg_box(
+                self.hwnd,
+                "No saved subscription selected to delete.",
+                "Subscription",
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return;
+        };
+
+        let node_cnt = self
+            .state
+            .nodes
+            .iter()
+            .filter(|n| n.source_sub_id.as_deref() == Some(sub.id.as_str()))
+            .count();
+        let prompt = format!(
+            "Delete subscription '{}' and its {} server(s)?\n\nManual nodes and other subscriptions will remain intact.",
+            sub_combo_label(&sub),
+            node_cnt
+        );
+        if msg_box(
+            self.hwnd,
+            &prompt,
+            "Delete Subscription",
+            MB_YESNO | MB_ICONQUESTION,
+        ) != IDYES
+        {
+            return;
+        }
+
+        self.cancel_real_ping();
+        self.ping_gen = self.ping_gen.wrapping_add(1);
+        self.state.subscriptions.retain(|s| s.id != sub.id);
+        self.state
+            .nodes
+            .retain(|n| n.source_sub_id.as_deref() != Some(sub.id.as_str()));
+        self.sub_retry_after.remove(&sub.id);
+        self.active_sub_id = self.state.subscriptions.first().map(|s| s.id.clone());
+        self.state.subscription_url = self
+            .state
+            .subscriptions
+            .first()
+            .map(|s| s.url.clone())
+            .unwrap_or_default();
+        let _ = self.state.save();
+        self.rebuild_sub_combo();
+        self.rebuild_node_list();
+        self.append_log(&format!(
+            "Removed subscription '{}' ({} server(s)).",
+            short_sub_host(&sub.url),
+            node_cnt
+        ));
+    }
+
+    unsafe fn check_due_subscription_updates(&mut self) {
+        if self.sub_fetching {
+            return;
+        }
+        let now = now_unix();
+        let due = self.state.subscriptions.iter().find(|sub| {
+            if sub.update_interval_hours == 0 {
+                return false;
+            }
+            if self.sub_retry_after.get(&sub.id).copied().unwrap_or(0) > now {
+                return false;
+            }
+            let interval_secs = (sub.update_interval_hours as u64).saturating_mul(3600);
+            now.saturating_sub(sub.last_updated_unix) >= interval_secs
         });
+        if let Some(sub) = due.cloned() {
+            self.start_subscription_fetch(sub.url, Some(sub.id), true);
+        }
+    }
+
+    unsafe fn cancel_real_ping(&mut self) {
+        if let Some(cancel) = self.real_ping_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.real_ping_gen = self.real_ping_gen.wrapping_add(1);
+        if !self.h_btn_real_ping.is_null() {
+            set_text(self.h_btn_real_ping, "Real Ping");
+        }
+    }
+
+    fn current_outbound_opts(&self) -> OutboundOpts {
+        OutboundOpts {
+            fragment: self.state.enable_fragment,
+            noise: self.state.enable_noise,
+            mux: self.state.enable_mux,
+        }
     }
 
     unsafe fn on_ping_all(&mut self) {
-        if self.state.nodes.is_empty() || self.stability_cancel.is_some() {
+        if self.state.nodes.is_empty() {
             return;
         }
         if self.connected && self.state.mode == ProxyMode::Tun && self.state.kill_switch {
-            self.append_log("Note: Kill-Switch (allexceptlan) blocks direct Wi-Fi TCP ping; disconnect first.");
+            self.append_log(
+                "Note: Kill-Switch (allexceptlan) blocks direct Wi-Fi TCP ping; disconnect first.",
+            );
         }
+        self.ping_gen = self.ping_gen.wrapping_add(1);
+        let gen = self.ping_gen;
         EnableWindow(self.h_btn_ping, 0);
-        EnableWindow(self.h_btn_stability, 0);
         set_text(self.h_btn_ping, "Pinging...");
         self.append_log("Running TCP ping on all servers...");
         let targets = extract_ping_targets(&self.state.nodes);
@@ -1618,60 +2093,117 @@ impl AppContext {
         ping_all_async(
             targets,
             move |idx, ms| {
-                let _ = tx1.send(UiEvent::PingResult(idx, ms));
+                let _ = tx1.send(UiEvent::PingResult(gen, idx, ms));
                 PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
             },
             move || {
-                let _ = tx2.send(UiEvent::PingFinished);
+                let _ = tx2.send(UiEvent::PingFinished(gen));
                 PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
             },
         );
     }
 
-    unsafe fn on_stability_toggle(&mut self) {
-        if let Some(ref flag) = self.stability_cancel {
-            flag.store(true, Ordering::Relaxed);
-            EnableWindow(self.h_btn_stability, 0);
-            set_text(self.h_btn_stability, "Stopping...");
+    unsafe fn on_ping_single(&mut self, idx: usize) {
+        let Some((name, addr, port)) = self
+            .state
+            .nodes
+            .get(idx)
+            .map(|n| (n.name.clone(), n.address.clone(), n.port))
+        else {
+            return;
+        };
+        if self.connected && self.state.mode == ProxyMode::Tun && self.state.kill_switch {
+            self.append_log(
+                "Note: Kill-Switch (allexceptlan) blocks direct Wi-Fi TCP ping; disconnect first.",
+            );
+        }
+        self.ping_gen = self.ping_gen.wrapping_add(1);
+        let gen = self.ping_gen;
+        let targets = vec![(idx, addr, port)];
+        self.append_log(&format!("Running TCP ping on {}...", name));
+        let tx1 = self.ev_tx.clone();
+        let tx2 = self.ev_tx.clone();
+        let hwnd_raw = self.hwnd as usize;
+        ping_all_async(
+            targets,
+            move |i, ms| {
+                let _ = tx1.send(UiEvent::PingResult(gen, i, ms));
+                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+            },
+            move || {
+                let _ = tx2.send(UiEvent::PingFinished(gen));
+                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+            },
+        );
+    }
+
+    unsafe fn start_real_ping_nodes(&mut self, items: Vec<(usize, VlessNode)>, desc: &str) {
+        if items.is_empty() {
+            return;
+        }
+        self.cancel_real_ping();
+        if self.connected && self.state.mode == ProxyMode::Tun && self.state.kill_switch {
+            self.append_log(
+                "Note: Kill-Switch (allexceptlan) blocks direct Real Ping; disconnect first.",
+            );
+        }
+        let gen = self.real_ping_gen;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.real_ping_cancel = Some(cancel.clone());
+        set_text(self.h_btn_real_ping, "Stop");
+        self.append_log(&format!("Running Real Ping (HTTPS /generate_204) on {}...", desc));
+
+        let bind_physical = self.connected && self.state.mode == ProxyMode::Tun;
+        let opts = self.current_outbound_opts();
+        let tx1 = self.ev_tx.clone();
+        let tx2 = self.ev_tx.clone();
+        let tx3 = self.ev_tx.clone();
+        let hwnd_raw = self.hwnd as usize;
+        real_ping_all_async(
+            items,
+            bind_physical,
+            opts,
+            cancel,
+            move |idx, ms| {
+                let _ = tx1.send(UiEvent::RealPingResult(gen, idx, ms));
+                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+            },
+            move |err| {
+                let _ = tx2.send(UiEvent::RealPingError(gen, err));
+                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+            },
+            move || {
+                let _ = tx3.send(UiEvent::RealPingFinished(gen));
+                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
+            },
+        );
+    }
+
+    unsafe fn on_real_ping_toggle(&mut self) {
+        if self.real_ping_cancel.is_some() {
+            self.cancel_real_ping();
+            self.append_log("Real ping cancelled.");
             return;
         }
         if self.state.nodes.is_empty() {
             return;
         }
-        if self.connected && self.state.mode == ProxyMode::Tun && self.state.kill_switch {
-            self.append_log("Note: Kill-Switch (allexceptlan) blocks direct Wi-Fi TCP probes; disconnect first.");
-        }
-        for n in &mut self.state.nodes {
-            n.stability = None;
-        }
-        self.rebuild_node_list();
+        let items: Vec<(usize, VlessNode)> = self
+            .state
+            .nodes
+            .iter()
+            .cloned()
+            .enumerate()
+            .collect();
+        self.start_real_ping_nodes(items, "all servers");
+    }
 
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.stability_cancel = Some(cancel.clone());
-        self.stability_gen = self.stability_gen.wrapping_add(1);
-        let gen = self.stability_gen;
-        EnableWindow(self.h_btn_ping, 0);
-        set_text(self.h_btn_stability, "Stop");
-        self.append_log("Running 10-probe stability test (~5s)...");
-
-        let targets = extract_ping_targets(&self.state.nodes);
-        let tx1 = self.ev_tx.clone();
-        let tx2 = self.ev_tx.clone();
-        let hwnd_raw = self.hwnd as usize;
-        stability_test_all_async(
-            targets,
-            10,
-            500,
-            cancel,
-            move |idx, stats| {
-                let _ = tx1.send(UiEvent::StabilityResult(gen, idx, stats));
-                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
-            },
-            move || {
-                let _ = tx2.send(UiEvent::StabilityFinished(gen));
-                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
-            },
-        );
+    unsafe fn on_real_ping_single(&mut self, idx: usize) {
+        let Some(node) = self.state.nodes.get(idx).cloned() else {
+            return;
+        };
+        let name = node.name.clone();
+        self.start_real_ping_nodes(vec![(idx, node)], &name);
     }
 
     // Automatically prompts Windows UAC and relaunches elevated; rolls back if UAC is cancelled
@@ -1752,7 +2284,7 @@ impl AppContext {
         };
 
         if node.allow_insecure {
-            self.append_log("WARNING: Selected server has allowInsecure=true (TLS certificate verification disabled).");
+            self.append_log("Note: Server URI specifies allowInsecure=1 (removed in Xray 26.x; strict TLS verification is enforced).");
         }
 
         let cfg = match build_xray_config(&self.state, &node) {
@@ -1826,7 +2358,7 @@ impl AppContext {
                 self.connected = true;
                 self.connected_node_key = Some((node.uuid.clone(), node.address.clone(), node.port));
                 InvalidateRect(self.h_list_nodes, null(), 1);
-                self.start_live_monitor();
+                self.clear_traffic_stats();
                 let _ = self.state.save();
                 // Drain core startup stdout lines first so our Connected summary stays visible at bottom
                 self.drain_ui_events();
@@ -1863,7 +2395,7 @@ impl AppContext {
 
     unsafe fn disconnect(&mut self) {
         KillTimer(self.hwnd, TIMER_STATS);
-        self.stop_live_monitor();
+        self.clear_traffic_stats();
         self.tun_luid = None;
         self.stats_base = None;
         self.stats_prev = None;
@@ -1891,77 +2423,210 @@ impl AppContext {
         while let Ok(ev) = self.ev_rx.try_recv() {
             match ev {
                 UiEvent::LogLine(line) => self.append_log(&line),
-                UiEvent::SubFetched(res) => {
+                UiEvent::SubFetched {
+                    sub_id,
+                    url,
+                    silent,
+                    res,
+                } => {
+                    self.sub_fetching = false;
                     EnableWindow(self.h_btn_fetch, 1);
                     set_text(self.h_btn_fetch, "Update");
                     match res {
-                        Ok(nodes) => {
-                            let prev_key = self
+                        Ok(SubFetchOutcome { mut nodes, resp }) => {
+                            self.sub_retry_after.remove(&sub_id);
+                            let had_sel = SendMessageW(self.h_list_nodes, LB_GETCURSEL, 0, 0) >= 0;
+                            let prev_key = self.state.nodes.get(self.state.selected_index).map(|n| {
+                                (
+                                    n.protocol.clone(),
+                                    n.uuid.clone(),
+                                    n.address.clone(),
+                                    n.port,
+                                )
+                            });
+                            let old_pings: HashMap<(String, String, String, u16), u32> = self
                                 .state
                                 .nodes
-                                .get(self.state.selected_index)
-                                .map(|n| (n.uuid.clone(), n.address.clone(), n.port));
+                                .iter()
+                                .filter_map(|n| {
+                                    n.ping_ms.map(|ms| {
+                                        (
+                                            (
+                                                n.protocol.clone(),
+                                                n.uuid.clone(),
+                                                n.address.clone(),
+                                                n.port,
+                                            ),
+                                            ms,
+                                        )
+                                    })
+                                })
+                                .collect();
+                            for n in &mut nodes {
+                                n.source_sub_id = Some(sub_id.clone());
+                                let k = (
+                                    n.protocol.clone(),
+                                    n.uuid.clone(),
+                                    n.address.clone(),
+                                    n.port,
+                                );
+                                if let Some(&ms) = old_pings.get(&k) {
+                                    n.ping_ms = Some(ms);
+                                }
+                            }
+
                             let cnt = nodes.len();
+                            let first_pos = self
+                                .state
+                                .nodes
+                                .iter()
+                                .position(|n| n.source_sub_id.as_deref() == Some(sub_id.as_str()));
+                            self.state
+                                .nodes
+                                .retain(|n| n.source_sub_id.as_deref() != Some(sub_id.as_str()));
+                            if let Some(pos) = first_pos {
+                                let insert_at = pos.min(self.state.nodes.len());
+                                self.state.nodes.splice(insert_at..insert_at, nodes);
+                            } else {
+                                self.state.nodes.extend(nodes);
+                            }
+
+                            let now = now_unix();
+                            let sub_title = if let Some(existing) =
+                                self.state.subscriptions.iter_mut().find(|s| s.id == sub_id)
+                            {
+                                existing.url = url.clone();
+                                existing.last_updated_unix = now;
+                                if let Some(ref title) = resp.profile_title {
+                                    if !title.trim().is_empty() {
+                                        existing.name = title.trim().to_string();
+                                    }
+                                } else if existing.name.trim().is_empty() {
+                                    existing.name = short_sub_host(&url);
+                                }
+                                if let Some(hrs) = resp.update_interval_hours {
+                                    existing.update_interval_hours = hrs;
+                                }
+                                if let Some(ref ui) = resp.userinfo {
+                                    existing.userinfo = ui.clone();
+                                }
+                                existing.name.clone()
+                            } else {
+                                let title = resp
+                                    .profile_title
+                                    .clone()
+                                    .filter(|s| !s.trim().is_empty())
+                                    .unwrap_or_else(|| short_sub_host(&url));
+                                self.state.subscriptions.push(SubscriptionProfile {
+                                    id: sub_id.clone(),
+                                    name: title.clone(),
+                                    url: url.clone(),
+                                    update_interval_hours: resp.update_interval_hours.unwrap_or(0),
+                                    last_updated_unix: now,
+                                    userinfo: resp.userinfo.clone().unwrap_or_default(),
+                                });
+                                title
+                            };
+
+                            if !silent || self.active_sub_id.is_none() {
+                                self.active_sub_id = Some(sub_id.clone());
+                                self.state.subscription_url = url.clone();
+                            }
+                            if let Some(ref ui) = resp.userinfo {
+                                self.state.subscription_info = ui.clone();
+                            }
+
                             let preserved_idx = prev_key
-                                .and_then(|(u, a, p)| {
-                                    nodes
-                                        .iter()
-                                        .position(|n| n.uuid == u && n.address == a && n.port == p)
+                                .and_then(|(pr, u, a, p)| {
+                                    self.state.nodes.iter().position(|n| {
+                                        n.protocol == pr && n.uuid == u && n.address == a && n.port == p
+                                    })
                                 })
                                 .unwrap_or(0);
-                            if let Some(flag) = self.stability_cancel.take() {
-                                flag.store(true, Ordering::Relaxed);
-                                self.stability_gen = self.stability_gen.wrapping_add(1);
-                                EnableWindow(self.h_btn_ping, 1);
-                                EnableWindow(self.h_btn_stability, 1);
-                                set_text(self.h_btn_stability, "Stability");
-                            }
-                            self.state.nodes = nodes;
                             self.state.selected_index = preserved_idx;
+                            self.cancel_real_ping();
+                            self.ping_gen = self.ping_gen.wrapping_add(1);
                             let _ = self.state.save();
-                            self.rebuild_node_list();
-                            self.append_log(&format!("Subscription updated: {} server(s).", cnt));
+                            self.rebuild_sub_combo();
+                            self.rebuild_node_list_with_sel(if silent { had_sel } else { true });
+
+                            let mut extras: Vec<String> = Vec::new();
+                            if let Some(ref ui) = resp.userinfo {
+                                if !ui.is_empty() {
+                                    extras.push(ui.clone());
+                                }
+                            }
+                            if let Some(hrs) = resp.update_interval_hours {
+                                if hrs > 0 {
+                                    extras.push(format!("auto {}h", hrs));
+                                }
+                            }
+                            if resp.via_proxy {
+                                extras.push("via proxy".to_string());
+                            }
+                            if extras.is_empty() {
+                                self.append_log(&format!(
+                                    "Subscription '{}' updated: {} server(s).",
+                                    sub_title, cnt
+                                ));
+                            } else {
+                                self.append_log(&format!(
+                                    "Subscription '{}' updated: {} server(s) ({}).",
+                                    sub_title,
+                                    cnt,
+                                    extras.join(", ")
+                                ));
+                            }
+                            if silent {
+                                self.check_due_subscription_updates();
+                            }
                         }
                         Err(e) => {
-                            self.append_log(&format!("Subscription error: {}", e));
-                            msg_box(self.hwnd, &e, "Subscription Error", MB_OK | MB_ICONERROR);
+                            if silent {
+                                self.sub_retry_after
+                                    .insert(sub_id, now_unix().saturating_add(900));
+                                self.append_log(&format!("Auto-update failed: {}", e));
+                                self.check_due_subscription_updates();
+                            } else {
+                                self.append_log(&format!("Subscription error: {}", e));
+                                msg_box(self.hwnd, &e, "Subscription Error", MB_OK | MB_ICONERROR);
+                            }
                         }
                     }
                 }
-                UiEvent::PingResult(idx, ms) => {
-                    if let Some(n) = self.state.nodes.get_mut(idx) {
-                        n.ping_ms = Some(ms);
-                    }
-                    self.update_single_node_row(idx);
-                }
-                UiEvent::PingFinished => {
-                    EnableWindow(self.h_btn_ping, 1);
-                    EnableWindow(self.h_btn_stability, 1);
-                    set_text(self.h_btn_ping, "Ping All");
-                    self.append_log("TCP ping finished.");
-                }
-                UiEvent::StabilityResult(gen, idx, stats) => {
-                    if gen == self.stability_gen {
+                UiEvent::PingResult(gen, idx, ms) => {
+                    if gen == self.ping_gen {
                         if let Some(n) = self.state.nodes.get_mut(idx) {
-                            n.stability = Some(stats);
-                            n.ping_ms = Some(stats.avg_ms);
+                            n.ping_ms = Some(ms);
                         }
                         self.update_single_node_row(idx);
                     }
                 }
-                UiEvent::StabilityFinished(gen) => {
-                    if gen == self.stability_gen {
-                        self.stability_cancel = None;
+                UiEvent::PingFinished(gen) => {
+                    if gen == self.ping_gen {
                         EnableWindow(self.h_btn_ping, 1);
-                        EnableWindow(self.h_btn_stability, 1);
-                        set_text(self.h_btn_stability, "Stability");
-                        self.append_log("Stability test finished.");
+                        set_text(self.h_btn_ping, "TCP Ping");
+                        self.append_log("TCP ping finished.");
                     }
                 }
-                UiEvent::LivePingUpdate(gen, stats) => {
-                    if self.connected && gen == self.live_ping_gen {
-                        self.live_ping = Some(stats);
-                        self.update_status_and_tray();
+                UiEvent::RealPingResult(gen, idx, ms) => {
+                    if gen == self.real_ping_gen {
+                        if let Some(n) = self.state.nodes.get_mut(idx) {
+                            n.ping_ms = Some(ms);
+                        }
+                        self.update_single_node_row(idx);
+                    }
+                }
+                UiEvent::RealPingError(gen, err) => {
+                    if gen == self.real_ping_gen {
+                        self.append_log(&err);
+                    }
+                }
+                UiEvent::RealPingFinished(gen) => {
+                    if gen == self.real_ping_gen {
+                        self.real_ping_cancel = None;
+                        set_text(self.h_btn_real_ping, "Real Ping");
+                        self.append_log("Real ping finished.");
                     }
                 }
                 UiEvent::GeoUpdated(res) => {
@@ -1982,11 +2647,16 @@ impl AppContext {
                         }
                     }
                 }
-                UiEvent::UpdateChecked(res) => {
-                    EnableWindow(self.h_btn_check_update, 1);
-                    set_text(self.h_btn_check_update, "Check Updates");
+                UiEvent::UpdateChecked { silent, res } => {
+                    self.update_checking = false;
+                    if !silent {
+                        EnableWindow(self.h_btn_check_update, 1);
+                        set_text(self.h_btn_check_update, "Check Updates");
+                    }
                     match res {
                         Ok(rel) => {
+                            self.state.last_update_check_unix = now_unix();
+                            let _ = self.state.save();
                             if is_newer_version(APP_VERSION, &rel.tag) {
                                 set_text(
                                     self.h_lbl_update_info,
@@ -1996,40 +2666,43 @@ impl AppContext {
                                     "Update available: {} (current v{}).",
                                     rel.tag, APP_VERSION
                                 ));
-                                let prompt = format!(
-                                    "New version {} is available (current: v{}).\n\nDownload, verify SHA256, and restart now?",
-                                    rel.tag, APP_VERSION
-                                );
-                                if msg_box(
-                                    self.hwnd,
-                                    &prompt,
-                                    "Update Available",
-                                    MB_YESNO | MB_ICONQUESTION,
-                                ) == IDYES
-                                {
-                                    self.start_update_download(rel);
+                                if !silent || IsWindowVisible(self.hwnd) != 0 {
+                                    self.pending_update = None;
+                                    self.update_status_and_tray();
+                                    self.prompt_update_dialog(rel);
+                                } else {
+                                    self.pending_update = Some(rel);
+                                    self.update_status_and_tray();
                                 }
                             } else {
+                                self.pending_update = None;
                                 set_text(
                                     self.h_lbl_update_info,
                                     &format!("Up to date (v{})", APP_VERSION),
                                 );
-                                self.append_log(&format!(
-                                    "Already on latest version (v{}, GitHub latest: {}).",
-                                    APP_VERSION, rel.tag
-                                ));
-                                msg_box(
-                                    self.hwnd,
-                                    &format!("You are already using the latest version (v{}).", APP_VERSION),
-                                    "Check Updates",
-                                    MB_OK | MB_ICONINFORMATION,
-                                );
+                                if !silent {
+                                    self.append_log(&format!(
+                                        "Already on latest version (v{}, GitHub latest: {}).",
+                                        APP_VERSION, rel.tag
+                                    ));
+                                    msg_box(
+                                        self.hwnd,
+                                        &format!(
+                                            "You are already using the latest version (v{}).",
+                                            APP_VERSION
+                                        ),
+                                        "Check Updates",
+                                        MB_OK | MB_ICONINFORMATION,
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
-                            set_text(self.h_lbl_update_info, "Update check failed");
-                            self.append_log(&format!("Update check failed: {}", e));
-                            msg_box(self.hwnd, &e, "Update Check Error", MB_OK | MB_ICONERROR);
+                            if !silent {
+                                set_text(self.h_lbl_update_info, "Update check failed");
+                                self.append_log(&format!("Update check failed: {}", e));
+                                msg_box(self.hwnd, &e, "Update Check Error", MB_OK | MB_ICONERROR);
+                            }
                         }
                     }
                 }
@@ -2062,7 +2735,7 @@ impl AppContext {
                 UiEvent::XrayExited(exited_pid) => {
                     if self.connected && self.runner.active_pid() == Some(exited_pid) {
                         KillTimer(self.hwnd, TIMER_STATS);
-                        self.stop_live_monitor();
+                        self.clear_traffic_stats();
                         self.tun_luid = None;
                         self.stats_base = None;
                         self.stats_prev = None;
@@ -2078,6 +2751,157 @@ impl AppContext {
                 }
             }
         }
+    }
+
+    unsafe fn selected_node_index(&self) -> Option<usize> {
+        let sel = SendMessageW(self.h_list_nodes, LB_GETCURSEL, 0, 0);
+        if sel >= 0 && (sel as usize) < self.state.nodes.len() {
+            Some(sel as usize)
+        } else {
+            None
+        }
+    }
+
+    unsafe fn on_remove_selected_node(&mut self) {
+        let Some(idx) = self.selected_node_index() else {
+            return;
+        };
+        self.cancel_real_ping();
+        self.ping_gen = self.ping_gen.wrapping_add(1);
+        self.state.nodes.remove(idx);
+        if self.state.selected_index >= self.state.nodes.len() && !self.state.nodes.is_empty() {
+            self.state.selected_index = self.state.nodes.len() - 1;
+        }
+        let _ = self.state.save();
+        self.rebuild_node_list();
+    }
+
+    unsafe fn on_copy_selected_uri(&mut self) {
+        let Some(idx) = self.selected_node_index() else {
+            return;
+        };
+        let uri = self.state.nodes[idx].to_share_uri();
+        let name = self.state.nodes[idx].name.clone();
+        if set_clipboard_text(self.hwnd, &uri) {
+            self.append_log(&format!("Copied URI for '{}' to clipboard.", name));
+        } else {
+            self.append_log("Failed to write URI to clipboard.");
+        }
+    }
+
+    unsafe fn on_rename_selected_node(&mut self) {
+        let Some(idx) = self.selected_node_index() else {
+            return;
+        };
+        let old_name = self.state.nodes[idx].name.clone();
+        if let Some(new_name) = show_rename_dialog(self.hwnd, self.dpi, self.font_ui, &old_name) {
+            if new_name != old_name {
+                self.state.nodes[idx].name = new_name.clone();
+                let old_target = format!("node:{}", old_name);
+                let new_target = format!("node:{}", new_name);
+                for rule in &mut self.state.custom_rules {
+                    if rule.target == old_target {
+                        rule.target = new_target.clone();
+                    }
+                }
+                let _ = self.state.save();
+                self.state.selected_index = idx;
+                self.rebuild_node_list();
+                self.rebuild_rule_list(None);
+                self.append_log(&format!("Renamed server '{}' -> '{}'.", old_name, new_name));
+            }
+        }
+    }
+
+    unsafe fn on_edit_selected_node(&mut self) {
+        let Some(idx) = self.selected_node_index() else {
+            return;
+        };
+        let orig = self.state.nodes[idx].clone();
+        if let Some(updated) = show_edit_node_dialog(
+            self.hwnd,
+            self.dpi,
+            self.font_ui,
+            self.font_mono,
+            &orig,
+        ) {
+            let old_name = orig.name.clone();
+            let new_name = updated.name.clone();
+            let net_changed = orig.address != updated.address
+                || orig.port != updated.port
+                || orig.uuid != updated.uuid
+                || orig.sni != updated.sni
+                || orig.network != updated.network
+                || orig.security != updated.security
+                || orig.path != updated.path
+                || orig.service_name != updated.service_name;
+
+            self.state.nodes[idx] = updated;
+            if new_name != old_name {
+                let old_target = format!("node:{}", old_name);
+                let new_target = format!("node:{}", new_name);
+                for rule in &mut self.state.custom_rules {
+                    if rule.target == old_target {
+                        rule.target = new_target.clone();
+                    }
+                }
+            }
+            let _ = self.state.save();
+            self.state.selected_index = idx;
+            self.rebuild_node_list();
+            self.rebuild_rule_list(None);
+            if net_changed && self.connected {
+                self.append_log(&format!(
+                    "Updated server '{}'. Reconnect to apply changes.",
+                    new_name
+                ));
+            } else {
+                self.append_log(&format!("Updated server '{}'.", new_name));
+            }
+        }
+    }
+
+    unsafe fn show_node_context_menu(&mut self) {
+        let menu: HMENU = CreatePopupMenu();
+        if menu.is_null() {
+            return;
+        }
+        let has_sel = self.selected_node_index().is_some();
+        let node_flag = if has_sel { MF_STRING } else { MF_STRING | MF_GRAYED };
+
+        let s_connect = to_wide("Connect");
+        let s_tcp_ping = to_wide("TCP Ping");
+        let s_real_ping = to_wide("Real Ping");
+        let s_import = to_wide("Import from Clipboard (Ctrl+V)");
+        let s_copy = to_wide("Copy URI");
+        let s_rename = to_wide("Rename...");
+        let s_edit = to_wide("Edit / Details...");
+        let s_remove = to_wide("Remove");
+
+        AppendMenuW(menu, node_flag, ID_CTX_CONNECT, s_connect.as_ptr());
+        AppendMenuW(menu, node_flag, ID_CTX_TCP_PING, s_tcp_ping.as_ptr());
+        AppendMenuW(menu, node_flag, ID_CTX_REAL_PING, s_real_ping.as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(menu, MF_STRING, ID_CTX_IMPORT_CLIP, s_import.as_ptr());
+        AppendMenuW(menu, node_flag, ID_CTX_COPY_URI, s_copy.as_ptr());
+        AppendMenuW(menu, node_flag, ID_CTX_RENAME, s_rename.as_ptr());
+        AppendMenuW(menu, node_flag, ID_CTX_EDIT, s_edit.as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        AppendMenuW(menu, node_flag, ID_CTX_REMOVE, s_remove.as_ptr());
+
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        SetForegroundWindow(self.hwnd);
+        TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN,
+            pt.x,
+            pt.y,
+            0,
+            self.hwnd,
+            null(),
+        );
+        DestroyMenu(menu);
     }
 
     unsafe fn show_tray_menu(&self) {
@@ -2137,9 +2961,7 @@ impl AppContext {
 
     unsafe fn full_exit(&mut self) {
         self.exiting = true;
-        if let Some(flag) = self.stability_cancel.take() {
-            flag.store(true, Ordering::Relaxed);
-        }
+        self.cancel_real_ping();
         self.disconnect();
         let _ = self.state.save();
         self.remove_tray_icon();
@@ -2220,53 +3042,117 @@ impl AppContext {
                 .map(|(u, a, p)| u == &node.uuid && a == &node.address && *p == node.port)
                 .unwrap_or(false);
 
-        let pad_x = scale_dpi(4, self.dpi);
-        let mut rc = dis.rcItem;
-        rc.left += pad_x;
+        let pad_x = scale_dpi(6, self.dpi);
+        let gap = scale_dpi(12, self.dpi);
+        let name_w = scale_dpi(108, self.dpi);
+        let proto_w = scale_dpi(88, self.dpi);
+        let ping_w = scale_dpi(62, self.dpi);
 
-        if is_active {
-            let old_font = SelectObject(hdc, self.font_mono_bold as _);
-            let w_name = to_wide(&node.name);
-            let mut calc = rc;
-            DrawTextW(
-                hdc,
-                w_name.as_ptr(),
-                (w_name.len().saturating_sub(1)) as i32,
-                &mut calc,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_CALCRECT,
-            );
-            DrawTextW(
-                hdc,
-                w_name.as_ptr(),
-                (w_name.len().saturating_sub(1)) as i32,
-                &mut rc,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
+        let top = dis.rcItem.top;
+        let bottom = dis.rcItem.bottom;
+        let right = dis.rcItem.right - pad_x;
 
-            SelectObject(hdc, self.font_mono as _);
-            let mut rc_rest = dis.rcItem;
-            rc_rest.left = calc.right;
-            let w_rest = to_wide(&node.display_details());
+        let rc_ping = RECT {
+            left: (right - ping_w).max(dis.rcItem.left),
+            top,
+            right,
+            bottom,
+        };
+        let rc_proto = RECT {
+            left: (rc_ping.left - gap - proto_w).max(dis.rcItem.left),
+            top,
+            right: (rc_ping.left - gap).max(dis.rcItem.left),
+            bottom,
+        };
+        let rc_name = RECT {
+            left: dis.rcItem.left + pad_x,
+            top,
+            right: (dis.rcItem.left + pad_x + name_w).min((rc_proto.left - gap).max(dis.rcItem.left + pad_x)),
+            bottom,
+        };
+        let rc_host = RECT {
+            left: rc_name.right + gap,
+            top,
+            right: (rc_proto.left - gap).max(rc_name.right + gap),
+            bottom,
+        };
+
+        let old_font = SelectObject(
+            hdc,
+            if is_active {
+                self.font_mono_bold as _
+            } else {
+                self.font_mono as _
+            },
+        );
+        let mut r_name = rc_name;
+        let w_name = to_wide(&node.name);
+        DrawTextW(
+            hdc,
+            w_name.as_ptr(),
+            (w_name.len().saturating_sub(1)) as i32,
+            &mut r_name,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+
+        SelectObject(hdc, self.font_mono as _);
+        if rc_host.right > rc_host.left + scale_dpi(16, self.dpi) {
+            let mut r_host = rc_host;
+            let w_host = to_wide(&node.address);
             DrawTextW(
                 hdc,
-                w_rest.as_ptr(),
-                (w_rest.len().saturating_sub(1)) as i32,
-                &mut rc_rest,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                w_host.as_ptr(),
+                (w_host.len().saturating_sub(1)) as i32,
+                &mut r_host,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
-            SelectObject(hdc, old_font);
-        } else {
-            let old_font = SelectObject(hdc, self.font_mono as _);
-            let w_row = to_wide(&node.display_row());
-            DrawTextW(
-                hdc,
-                w_row.as_ptr(),
-                (w_row.len().saturating_sub(1)) as i32,
-                &mut rc,
-                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
-            SelectObject(hdc, old_font);
         }
+
+        if rc_proto.right > rc_proto.left {
+            let mut r_proto = rc_proto;
+            let w_proto = to_wide(&node.protocol_tag());
+            DrawTextW(
+                hdc,
+                w_proto.as_ptr(),
+                (w_proto.len().saturating_sub(1)) as i32,
+                &mut r_proto,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+
+        if rc_ping.right > rc_ping.left {
+            const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+                (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
+            }
+            let (ping_text, ping_color) = match node.ping_ms {
+                None => ("-".to_string(), if selected { fg_color } else { rgb(124, 132, 144) }),
+                Some(0) => ("timeout".to_string(), if selected { fg_color } else { rgb(196, 43, 28) }),
+                Some(ms) => {
+                    let color = if selected {
+                        fg_color
+                    } else if ms > 250 {
+                        rgb(196, 43, 28)
+                    } else if ms > 120 {
+                        rgb(180, 105, 0)
+                    } else {
+                        rgb(21, 128, 61)
+                    };
+                    (format!("{} ms", ms), color)
+                }
+            };
+            SetTextColor(hdc, ping_color);
+            let mut r_ping = rc_ping;
+            let w_ping = to_wide(&ping_text);
+            DrawTextW(
+                hdc,
+                w_ping.as_ptr(),
+                (w_ping.len().saturating_sub(1)) as i32,
+                &mut r_ping,
+                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+            SetTextColor(hdc, fg_color);
+        }
+        SelectObject(hdc, old_font);
 
         if (dis.itemState & ODS_FOCUS) != 0 {
             DrawFocusRect(hdc, &dis.rcItem);
@@ -2303,6 +3189,32 @@ unsafe extern "system" fn listbox_deselect_proc(
         let res = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lparam) as u32;
         if (res >> 16) != 0 {
             SendMessageW(hwnd, LB_SETCURSEL, usize::MAX, 0);
+            return 0;
+        }
+    } else if msg == WM_RBUTTONUP {
+        if GetWindowLongPtrW(hwnd, GWL_ID) == ID_LIST_NODES as isize {
+            let res = SendMessageW(hwnd, LB_ITEMFROMPOINT, 0, lparam) as u32;
+            if (res >> 16) != 0 {
+                SendMessageW(hwnd, LB_SETCURSEL, usize::MAX, 0);
+            } else {
+                let idx = (res & 0xFFFF) as usize;
+                SendMessageW(hwnd, LB_SETCURSEL, idx, 0);
+            }
+            let parent = GetParent(hwnd);
+            if !parent.is_null() {
+                PostMessageW(parent, WM_NODE_CTXMENU, 0, 0);
+            }
+            return 0;
+        }
+    } else if msg == WM_KEYDOWN {
+        if GetWindowLongPtrW(hwnd, GWL_ID) == ID_LIST_NODES as isize
+            && wparam == 0x56
+            && ((GetKeyState(0x11) as u16) & 0x8000) != 0
+        {
+            let parent = GetParent(hwnd);
+            if !parent.is_null() {
+                PostMessageW(parent, WM_COMMAND, ID_CTX_IMPORT_CLIP, 0);
+            }
             return 0;
         }
     }
@@ -2411,10 +3323,15 @@ unsafe extern "system" fn wnd_proc(
         WM_SHOW_EXISTING => {
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
+            ctx.prompt_pending_update_if_any();
             0
         }
         WM_UI_EVENT => {
             ctx.drain_ui_events();
+            0
+        }
+        WM_NODE_CTXMENU => {
+            ctx.show_node_context_menu();
             0
         }
         WM_TRAYICON => {
@@ -2423,6 +3340,7 @@ unsafe extern "system" fn wnd_proc(
                 WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
                     ShowWindow(hwnd, SW_SHOW);
                     SetForegroundWindow(hwnd);
+                    ctx.prompt_pending_update_if_any();
                 }
                 WM_RBUTTONUP => {
                     ctx.show_tray_menu();
@@ -2456,6 +3374,14 @@ unsafe extern "system" fn wnd_proc(
                 }
             } else if wparam == TIMER_STATS {
                 ctx.on_stats_tick();
+            } else if wparam == TIMER_SUB_INIT {
+                KillTimer(hwnd, TIMER_SUB_INIT);
+                ctx.check_due_subscription_updates();
+            } else if wparam == TIMER_SUB_AUTO {
+                ctx.check_due_subscription_updates();
+            } else if wparam == TIMER_UPDATE_CHECK {
+                KillTimer(hwnd, TIMER_UPDATE_CHECK);
+                ctx.start_update_check(true);
             }
             0
         }
@@ -2475,29 +3401,63 @@ unsafe extern "system" fn wnd_proc(
             let id = wparam & 0xFFFF;
             let code = ((wparam >> 16) & 0xFFFF) as u32;
             match id {
-                ID_BTN_FETCH => ctx.on_fetch_subscription(),
-                ID_BTN_PING => ctx.on_ping_all(),
-                ID_BTN_STABILITY => ctx.on_stability_toggle(),
-                ID_BTN_DEL => {
-                    let sel = SendMessageW(ctx.h_list_nodes, LB_GETCURSEL, 0, 0);
-                    if sel >= 0 && (sel as usize) < ctx.state.nodes.len() {
-                        if let Some(flag) = ctx.stability_cancel.take() {
-                            flag.store(true, Ordering::Relaxed);
-                            ctx.stability_gen = ctx.stability_gen.wrapping_add(1);
-                            EnableWindow(ctx.h_btn_ping, 1);
-                            EnableWindow(ctx.h_btn_stability, 1);
-                            set_text(ctx.h_btn_stability, "Stability");
+                ID_EDIT_SUB => {
+                    if code == CBN_SELCHANGE {
+                        let sel = SendMessageW(ctx.h_edit_sub, CB_GETCURSEL, 0, 0);
+                        if sel >= 0 {
+                            if let Some(sub_id) = ctx.sub_combo_ids.get(sel as usize).cloned() {
+                                if let Some(sub) =
+                                    ctx.state.subscriptions.iter().find(|s| s.id == sub_id)
+                                {
+                                    ctx.active_sub_id = Some(sub_id);
+                                    ctx.state.subscription_url = sub.url.clone();
+                                    let _ = ctx.state.save();
+                                }
+                            }
                         }
-                        ctx.state.nodes.remove(sel as usize);
-                        if ctx.state.selected_index >= ctx.state.nodes.len()
-                            && !ctx.state.nodes.is_empty()
-                        {
-                            ctx.state.selected_index = ctx.state.nodes.len() - 1;
-                        }
-                        let _ = ctx.state.save();
-                        ctx.rebuild_node_list();
                     }
                 }
+                ID_BTN_FETCH => ctx.on_fetch_subscription(),
+                ID_BTN_SUB_ADD => ctx.on_add_nodes_action(),
+                ID_BTN_SUB_DEL => ctx.on_delete_subscription(),
+                ID_BTN_PING => ctx.on_ping_all(),
+                ID_BTN_REAL_PING => ctx.on_real_ping_toggle(),
+                ID_BTN_DEL | ID_CTX_REMOVE => ctx.on_remove_selected_node(),
+                ID_CTX_CONNECT => {
+                    if let Some(idx) = ctx.selected_node_index() {
+                        let clicked_key = ctx
+                            .state
+                            .nodes
+                            .get(idx)
+                            .map(|n| (n.uuid.clone(), n.address.clone(), n.port));
+                        if !(ctx.connected
+                            && clicked_key.is_some()
+                            && ctx.connected_node_key == clicked_key)
+                        {
+                            ctx.state.selected_index = idx;
+                            let _ = ctx.state.save();
+                            if ctx.connected {
+                                ctx.reconnect_if_connected();
+                            } else {
+                                ctx.connect();
+                            }
+                        }
+                    }
+                }
+                ID_CTX_TCP_PING => {
+                    if let Some(idx) = ctx.selected_node_index() {
+                        ctx.on_ping_single(idx);
+                    }
+                }
+                ID_CTX_REAL_PING => {
+                    if let Some(idx) = ctx.selected_node_index() {
+                        ctx.on_real_ping_single(idx);
+                    }
+                }
+                ID_CTX_IMPORT_CLIP => ctx.on_import_from_clipboard(),
+                ID_CTX_COPY_URI => ctx.on_copy_selected_uri(),
+                ID_CTX_RENAME => ctx.on_rename_selected_node(),
+                ID_CTX_EDIT => ctx.on_edit_selected_node(),
                 ID_LIST_NODES => {
                     if code == LBN_SELCHANGE {
                         let sel = SendMessageW(ctx.h_list_nodes, LB_GETCURSEL, 0, 0);
@@ -2697,6 +3657,7 @@ unsafe extern "system" fn wnd_proc(
                 ID_TRAY_SHOW => {
                     ShowWindow(hwnd, SW_SHOW);
                     SetForegroundWindow(hwnd);
+                    ctx.prompt_pending_update_if_any();
                 }
                 ID_TRAY_EXIT => {
                     ctx.full_exit();
@@ -2801,4 +3762,364 @@ fn fmt_rate(bps: u64) -> String {
     } else {
         format!("{} B/s", bps)
     }
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn sub_combo_label(sub: &SubscriptionProfile) -> String {
+    let host = short_sub_host(&sub.url);
+    let has_custom_title = !sub.name.trim().is_empty() && sub.name.trim() != host;
+    if has_custom_title || !sub.userinfo.is_empty() {
+        sub.display_label()
+    } else {
+        sub.url.clone()
+    }
+}
+
+const MODAL_DLG_CLASS: &str = "AvelModalDlgClass";
+static MODAL_CLASS_INIT: Once = Once::new();
+
+struct ModalState {
+    done: bool,
+    accepted: bool,
+}
+
+unsafe extern "system" fn modal_dlg_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ModalState;
+    if !ptr.is_null() {
+        let st = &mut *ptr;
+        match msg {
+            WM_COMMAND => {
+                let id = (wparam & 0xFFFF) as i32;
+                if id == IDOK {
+                    st.accepted = true;
+                    st.done = true;
+                    return 0;
+                } else if id == IDCANCEL {
+                    st.accepted = false;
+                    st.done = true;
+                    return 0;
+                }
+            }
+            WM_CLOSE => {
+                st.accepted = false;
+                st.done = true;
+                return 0;
+            }
+            _ => {}
+        }
+    }
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+unsafe fn create_modal_window(
+    owner: HWND,
+    dpi: i32,
+    title: &str,
+    client_w_dip: i32,
+    client_h_dip: i32,
+) -> HWND {
+    let h_inst = GetModuleHandleW(null());
+    MODAL_CLASS_INIT.call_once(|| {
+        let cls = to_wide(MODAL_DLG_CLASS);
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(modal_dlg_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: h_inst,
+            hIcon: null_mut(),
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            hbrBackground: (COLOR_BTNFACE + 1) as _,
+            lpszMenuName: null(),
+            lpszClassName: cls.as_ptr(),
+            hIconSm: null_mut(),
+        };
+        RegisterClassExW(&wc);
+    });
+
+    let style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: scale_dpi(client_w_dip, dpi),
+        bottom: scale_dpi(client_h_dip, dpi),
+    };
+    AdjustWindowRectExForDpi(&mut rc, style, 0, 0, dpi as u32);
+    let w = rc.right - rc.left;
+    let h = rc.bottom - rc.top;
+
+    let mut orc: RECT = std::mem::zeroed();
+    GetWindowRect(owner, &mut orc);
+    let x = ((orc.left + orc.right - w) / 2).max(20);
+    let y = ((orc.top + orc.bottom - h) / 2).max(20);
+
+    let cls = to_wide(MODAL_DLG_CLASS);
+    let w_title = to_wide(title);
+    CreateWindowExW(
+        0,
+        cls.as_ptr(),
+        w_title.as_ptr(),
+        style,
+        x,
+        y,
+        w,
+        h,
+        owner,
+        null_mut(),
+        h_inst,
+        null(),
+    )
+}
+
+unsafe fn show_rename_dialog(
+    owner: HWND,
+    dpi: i32,
+    font_ui: HFONT,
+    current_name: &str,
+) -> Option<String> {
+    let s = |v: i32| scale_dpi(v, dpi);
+    let h_inst = GetModuleHandleW(null());
+    let dlg = create_modal_window(owner, dpi, "Rename Server", 360, 118);
+    if dlg.is_null() {
+        return None;
+    }
+
+    mk_ctrl(dlg, h_inst, "STATIC", "Server name:", WS_CHILD | WS_VISIBLE, 0, s(12), s(14), s(336), s(18), 0, font_ui);
+    let h_edit = mk_ctrl(
+        dlg,
+        h_inst,
+        "EDIT",
+        current_name,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+        WS_EX_CLIENTEDGE,
+        s(12),
+        s(36),
+        s(336),
+        s(24),
+        3001,
+        font_ui,
+    );
+    mk_ctrl(
+        dlg,
+        h_inst,
+        "BUTTON",
+        "OK",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+        0,
+        s(188),
+        s(78),
+        s(76),
+        s(26),
+        IDOK as usize,
+        font_ui,
+    );
+    mk_ctrl(
+        dlg,
+        h_inst,
+        "BUTTON",
+        "Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32,
+        0,
+        s(272),
+        s(78),
+        s(76),
+        s(26),
+        IDCANCEL as usize,
+        font_ui,
+    );
+
+    let mut state = ModalState {
+        done: false,
+        accepted: false,
+    };
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, &mut state as *mut ModalState as isize);
+    EnableWindow(owner, 0);
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(h_edit);
+    SendMessageW(h_edit, 0x00B1, 0, -1isize); // EM_SETSEL all
+
+    let mut result = None;
+    let mut msg: MSG = std::mem::zeroed();
+    loop {
+        while !state.done && GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if IsDialogMessageW(dlg, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        if !state.accepted {
+            break;
+        }
+        let next = get_text(h_edit).trim().to_string();
+        if next.is_empty() {
+            msg_box(dlg, "Server name cannot be empty.", "Rename Server", MB_OK | MB_ICONERROR);
+            state.done = false;
+            state.accepted = false;
+            continue;
+        }
+        result = Some(next);
+        break;
+    }
+
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, 0);
+    EnableWindow(owner, 1);
+    DestroyWindow(dlg);
+    SetForegroundWindow(owner);
+    result
+}
+
+unsafe fn show_edit_node_dialog(
+    owner: HWND,
+    dpi: i32,
+    font_ui: HFONT,
+    font_mono: HFONT,
+    node: &VlessNode,
+) -> Option<VlessNode> {
+    let s = |v: i32| scale_dpi(v, dpi);
+    let h_inst = GetModuleHandleW(null());
+    let dlg = create_modal_window(owner, dpi, "Server Details", 456, 314);
+    if dlg.is_null() {
+        return None;
+    }
+
+    let lbl_w = s(86);
+    let ed_x = s(102);
+    let ed_w = s(340);
+
+    mk_ctrl(dlg, h_inst, "STATIC", "Name:", WS_CHILD | WS_VISIBLE, 0, s(12), s(17), lbl_w, s(18), 0, font_ui);
+    let h_name = mk_ctrl(dlg, h_inst, "EDIT", &node.name, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, ed_x, s(14), ed_w, s(22), 3101, font_ui);
+
+    mk_ctrl(dlg, h_inst, "STATIC", "Protocol:", WS_CHILD | WS_VISIBLE, 0, s(12), s(47), lbl_w, s(18), 0, font_ui);
+    mk_ctrl(dlg, h_inst, "EDIT", &node.protocol, WS_CHILD | WS_VISIBLE | ES_READONLY as u32, WS_EX_CLIENTEDGE, ed_x, s(44), s(140), s(22), 3102, font_mono);
+    mk_ctrl(dlg, h_inst, "STATIC", "Port:", WS_CHILD | WS_VISIBLE, 0, s(258), s(47), s(40), s(18), 0, font_ui);
+    let h_port = mk_ctrl(dlg, h_inst, "EDIT", &node.port.to_string(), WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_NUMBER as u32 | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, s(302), s(44), s(140), s(22), 3103, font_mono);
+
+    mk_ctrl(dlg, h_inst, "STATIC", "Address:", WS_CHILD | WS_VISIBLE, 0, s(12), s(77), lbl_w, s(18), 0, font_ui);
+    let h_addr = mk_ctrl(dlg, h_inst, "EDIT", &node.address, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, ed_x, s(74), ed_w, s(22), 3104, font_mono);
+
+    mk_ctrl(dlg, h_inst, "STATIC", "UUID / Key:", WS_CHILD | WS_VISIBLE, 0, s(12), s(107), lbl_w, s(18), 0, font_ui);
+    let h_uuid = mk_ctrl(dlg, h_inst, "EDIT", &node.uuid, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, ed_x, s(104), ed_w, s(22), 3105, font_mono);
+
+    mk_ctrl(dlg, h_inst, "STATIC", "SNI / Host:", WS_CHILD | WS_VISIBLE, 0, s(12), s(137), lbl_w, s(18), 0, font_ui);
+    let h_sni = mk_ctrl(dlg, h_inst, "EDIT", &node.sni, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, ed_x, s(134), ed_w, s(22), 3106, font_mono);
+
+    mk_ctrl(dlg, h_inst, "STATIC", "Network:", WS_CHILD | WS_VISIBLE, 0, s(12), s(167), lbl_w, s(18), 0, font_ui);
+    let h_net = mk_ctrl(dlg, h_inst, "EDIT", &node.network, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, ed_x, s(164), s(140), s(22), 3107, font_mono);
+    mk_ctrl(dlg, h_inst, "STATIC", "Security:", WS_CHILD | WS_VISIBLE, 0, s(250), s(167), s(52), s(18), 0, font_ui);
+    let h_sec = mk_ctrl(dlg, h_inst, "EDIT", &node.security, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, s(304), s(164), s(138), s(22), 3108, font_mono);
+
+    let init_path = if node.network == "grpc" && !node.service_name.is_empty() {
+        node.service_name.as_str()
+    } else {
+        node.path.as_str()
+    };
+    mk_ctrl(dlg, h_inst, "STATIC", "Path / Svc:", WS_CHILD | WS_VISIBLE, 0, s(12), s(197), lbl_w, s(18), 0, font_ui);
+    let h_path = mk_ctrl(dlg, h_inst, "EDIT", init_path, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, ed_x, s(194), ed_w, s(22), 3109, font_mono);
+
+    let uri_preview = node.to_share_uri();
+    mk_ctrl(dlg, h_inst, "STATIC", "Share URI:", WS_CHILD | WS_VISIBLE, 0, s(12), s(227), lbl_w, s(18), 0, font_ui);
+    mk_ctrl(dlg, h_inst, "EDIT", &uri_preview, WS_CHILD | WS_VISIBLE | ES_READONLY as u32 | ES_AUTOHSCROLL as u32, WS_EX_CLIENTEDGE, ed_x, s(224), ed_w, s(22), 3110, font_mono);
+
+    mk_ctrl(dlg, h_inst, "BUTTON", "Save", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32, 0, s(274), s(270), s(80), s(26), IDOK as usize, font_ui);
+    mk_ctrl(dlg, h_inst, "BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32, 0, s(362), s(270), s(80), s(26), IDCANCEL as usize, font_ui);
+
+    let mut state = ModalState {
+        done: false,
+        accepted: false,
+    };
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, &mut state as *mut ModalState as isize);
+    EnableWindow(owner, 0);
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(h_name);
+
+    let mut result = None;
+    let mut msg: MSG = std::mem::zeroed();
+    loop {
+        while !state.done && GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            if IsDialogMessageW(dlg, &msg) == 0 {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        if !state.accepted {
+            break;
+        }
+        let name = get_text(h_name).trim().to_string();
+        let addr = get_text(h_addr).trim().to_string();
+        let port_str = get_text(h_port).trim().to_string();
+        if name.is_empty() {
+            msg_box(dlg, "Name cannot be empty.", "Server Details", MB_OK | MB_ICONERROR);
+            state.done = false;
+            state.accepted = false;
+            continue;
+        }
+        if addr.is_empty() {
+            msg_box(dlg, "Address cannot be empty.", "Server Details", MB_OK | MB_ICONERROR);
+            state.done = false;
+            state.accepted = false;
+            continue;
+        }
+        let port = match port_str.parse::<u16>() {
+            Ok(p) if p >= 1 => p,
+            _ => {
+                msg_box(dlg, "Port must be between 1 and 65535.", "Server Details", MB_OK | MB_ICONERROR);
+                state.done = false;
+                state.accepted = false;
+                continue;
+            }
+        };
+
+        let mut updated = node.clone();
+        updated.name = name;
+        updated.address = addr;
+        updated.port = port;
+        updated.uuid = get_text(h_uuid).trim().to_string();
+        updated.sni = get_text(h_sni).trim().to_string();
+        let net = get_text(h_net).trim().to_lowercase();
+        if !net.is_empty() {
+            updated.network = net;
+        }
+        let sec = get_text(h_sec).trim().to_lowercase();
+        if !sec.is_empty() {
+            updated.security = sec;
+        }
+        let path_val = get_text(h_path).trim().to_string();
+        if updated.network == "grpc" {
+            updated.service_name = path_val;
+        } else {
+            updated.path = path_val;
+        }
+
+        let net_changed = updated.address != node.address
+            || updated.port != node.port
+            || updated.uuid != node.uuid
+            || updated.sni != node.sni
+            || updated.network != node.network
+            || updated.security != node.security
+            || updated.path != node.path
+            || updated.service_name != node.service_name;
+        if net_changed {
+            updated.raw_uri.clear();
+        }
+        result = Some(updated);
+        break;
+    }
+
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, 0);
+    EnableWindow(owner, 1);
+    DestroyWindow(dlg);
+    SetForegroundWindow(owner);
+    result
 }

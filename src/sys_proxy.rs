@@ -6,7 +6,9 @@ use std::os::windows::process::CommandExt;
 use std::process::Command;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{CloseHandle, FreeLibrary, HANDLE, HWND, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, FreeLibrary, GlobalFree, HANDLE, HWND, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     CreateIpForwardEntry2, GetAdaptersAddresses, GetBestInterface, GetExtendedTcpTable,
     GetIfEntry2, GetIpInterfaceEntry, InitializeIpForwardEntry, SetIpForwardEntry2,
@@ -22,12 +24,16 @@ use windows_sys::Win32::Networking::WinSock::AF_INET;
 use windows_sys::Win32::Security::{
     GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
 };
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, SetDefaultDllDirectories, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
+use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_DWORD, REG_SZ,
@@ -801,6 +807,63 @@ pub fn set_autostart(enable: bool) -> Result<&'static str, String> {
 
     set_run_key_autostart(true, Some(&cmd))?;
     Ok("Autostart enabled (user logon; run as Admin to enable elevated TUN autostart).")
+}
+
+const CF_UNICODETEXT_ID: u32 = 13;
+
+pub fn get_clipboard_text(owner: HWND) -> Option<String> {
+    unsafe {
+        if OpenClipboard(owner) == 0 {
+            return None;
+        }
+        let mut out = None;
+        let h_data = GetClipboardData(CF_UNICODETEXT_ID);
+        if !h_data.is_null() {
+            let ptr = GlobalLock(h_data) as *const u16;
+            if !ptr.is_null() {
+                let mut len = 0usize;
+                const MAX_CLIP_CHARS: usize = 512 * 1024;
+                while len < MAX_CLIP_CHARS && *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let slice = std::slice::from_raw_parts(ptr, len);
+                out = Some(String::from_utf16_lossy(slice));
+                GlobalUnlock(h_data);
+            }
+        }
+        CloseClipboard();
+        out
+    }
+}
+
+pub fn set_clipboard_text(owner: HWND, text: &str) -> bool {
+    let wide = to_wide(text);
+    let bytes = wide.len() * std::mem::size_of::<u16>();
+    unsafe {
+        if OpenClipboard(owner) == 0 {
+            return false;
+        }
+        EmptyClipboard();
+        let h_mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if h_mem.is_null() {
+            CloseClipboard();
+            return false;
+        }
+        let ptr = GlobalLock(h_mem) as *mut u16;
+        if ptr.is_null() {
+            GlobalFree(h_mem);
+            CloseClipboard();
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+        GlobalUnlock(h_mem);
+        let ok = !SetClipboardData(CF_UNICODETEXT_ID, h_mem).is_null();
+        if !ok {
+            GlobalFree(h_mem);
+        }
+        CloseClipboard();
+        ok
+    }
 }
 
 #[cfg(test)]

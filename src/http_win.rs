@@ -1,19 +1,21 @@
 use crate::sys_proxy::to_wide;
+use base64::Engine;
 use serde_json::Value;
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
     WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
     WinHttpSendRequest, WinHttpSetTimeouts, URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-    WINHTTP_ACCESS_TYPE_NAMED_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WINHTTP_ACCESS_TYPE_NAMED_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_CUSTOM,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+};
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
 };
 
 const INTERNET_SCHEME_HTTPS: i32 = 2;
@@ -22,9 +24,205 @@ const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024; // 4 MB safety limit
 
 pub struct SubscriptionResponse {
     pub body: String,
+    pub profile_title: Option<String>,
+    pub update_interval_hours: Option<u32>,
+    pub userinfo: Option<String>,
+    pub via_proxy: bool,
 }
 
-pub fn fetch_subscription(url: &str, user_agent: &str) -> Result<SubscriptionResponse, String> {
+pub fn fetch_subscription_opts(
+    url: &str,
+    user_agent: &str,
+    send_hwid: bool,
+    fallback_proxy_port: Option<u16>,
+) -> Result<SubscriptionResponse, String> {
+    match fetch_subscription_inner(url, user_agent, send_hwid, None) {
+        Ok(resp) => Ok(resp),
+        Err(direct_err) => {
+            if let Some(port) = fallback_proxy_port.filter(|&p| p > 0) {
+                match fetch_subscription_inner(url, user_agent, send_hwid, Some(port)) {
+                    Ok(mut resp) => {
+                        resp.via_proxy = true;
+                        Ok(resp)
+                    }
+                    Err(proxy_err) => Err(format!(
+                        "{} (proxy fallback on 127.0.0.1:{} also failed: {})",
+                        direct_err, port, proxy_err
+                    )),
+                }
+            } else {
+                Err(direct_err)
+            }
+        }
+    }
+}
+
+fn read_reg_string(subkey: &str, value_name: &str) -> Option<String> {
+    unsafe {
+        let mut hkey: HKEY = null_mut();
+        let w_sub = to_wide(subkey);
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, w_sub.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return None;
+        }
+        let w_val = to_wide(value_name);
+        let mut buf_bytes: u32 = 512;
+        let mut buf = vec![0u16; 256];
+        let mut ty: u32 = 0;
+        let rc = RegQueryValueExW(
+            hkey,
+            w_val.as_ptr(),
+            null_mut(),
+            &mut ty,
+            buf.as_mut_ptr() as *mut u8,
+            &mut buf_bytes,
+        );
+        RegCloseKey(hkey);
+        if rc != 0 || buf_bytes < 2 {
+            return None;
+        }
+        let chars = (buf_bytes as usize / 2).min(buf.len());
+        let s = String::from_utf16_lossy(&buf[..chars]);
+        let trimmed = s.trim_end_matches('\0').trim().to_string();
+        if trimmed.is_empty() { None } else { Some(trimmed) }
+    }
+}
+
+fn build_hwid_headers() -> String {
+    let guid = read_reg_string("SOFTWARE\\Microsoft\\Cryptography", "MachineGuid")
+        .unwrap_or_else(|| {
+            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "windows-host".to_string())
+        });
+    let mut hasher = Sha256::new();
+    hasher.update(b"avel-hwid-v1:");
+    hasher.update(guid.as_bytes());
+    let hwid = &hasher.finalize_hex()[..32];
+
+    let os_ver = read_reg_string(
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+        "CurrentBuildNumber",
+    )
+    .unwrap_or_else(|| "11".to_string());
+    let model = read_reg_string("HARDWARE\\DESCRIPTION\\System\\BIOS", "SystemProductName")
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "PC".to_string());
+    let clean_model: String = model
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(48)
+        .collect();
+
+    format!(
+        "x-hwid: {}\r\nx-device-os: Windows\r\nx-ver-os: {}\r\nx-device-model: {}\r\n",
+        hwid,
+        os_ver,
+        clean_model.trim()
+    )
+}
+
+unsafe fn query_custom_header(h_req: *mut core::ffi::c_void, name: &str) -> Option<String> {
+    let w_name = to_wide(name);
+    let mut buf = vec![0u16; 512];
+    let mut buf_bytes = (buf.len() * 2) as u32;
+    let ok = WinHttpQueryHeaders(
+        h_req,
+        WINHTTP_QUERY_CUSTOM,
+        w_name.as_ptr(),
+        buf.as_mut_ptr() as *mut _,
+        &mut buf_bytes,
+        null_mut(),
+    );
+    if ok == 0 || buf_bytes < 2 {
+        return None;
+    }
+    let chars = (buf_bytes as usize / 2).min(buf.len());
+    let s = String::from_utf16_lossy(&buf[..chars]);
+    let t = s.trim_end_matches('\0').trim().to_string();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+pub fn decode_profile_title(raw: &str) -> String {
+    let t = raw.trim();
+    if let Some(b64) = t.strip_prefix("base64:").or_else(|| t.strip_prefix("BASE64:")) {
+        let cleaned: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+        for eng in [
+            base64::engine::general_purpose::STANDARD,
+            base64::engine::general_purpose::STANDARD_NO_PAD,
+            base64::engine::general_purpose::URL_SAFE,
+            base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        ] {
+            if let Ok(bytes) = eng.decode(cleaned.as_bytes()) {
+                if let Ok(s) = String::from_utf8(bytes) {
+                    let s = s.trim().to_string();
+                    if !s.is_empty() {
+                        return s;
+                    }
+                }
+            }
+        }
+    }
+    t.to_string()
+}
+
+pub fn format_subscription_userinfo(raw: &str) -> Option<String> {
+    let mut upload: u64 = 0;
+    let mut download: u64 = 0;
+    let mut total: u64 = 0;
+    let mut expire: u64 = 0;
+    let mut any = false;
+    for part in raw.split(';') {
+        if let Some((k, v)) = part.split_once('=') {
+            let key = k.trim().to_lowercase();
+            let val = v.trim().parse::<u64>().ok();
+            match (key.as_str(), val) {
+                ("upload", Some(n)) => { upload = n; any = true; }
+                ("download", Some(n)) => { download = n; any = true; }
+                ("total", Some(n)) => { total = n; any = true; }
+                ("expire", Some(n)) => { expire = n; any = true; }
+                _ => {}
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let fmt_gb = |b: u64| -> String {
+        let gb = b as f64 / (1024.0 * 1024.0 * 1024.0);
+        if gb >= 100.0 {
+            format!("{:.0} GB", gb)
+        } else if gb >= 1.0 {
+            format!("{:.1} GB", gb)
+        } else {
+            format!("{:.0} MB", b as f64 / (1024.0 * 1024.0))
+        }
+    };
+    let used = upload.saturating_add(download);
+    let mut parts: Vec<String> = Vec::new();
+    if total > 0 {
+        parts.push(format!("{} / {}", fmt_gb(used), fmt_gb(total)));
+    } else if used > 0 {
+        parts.push(fmt_gb(used));
+    }
+    if expire > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if expire > now {
+            let days = (expire - now) / 86400;
+            parts.push(format!("{}d left", days));
+        } else {
+            parts.push("expired".to_string());
+        }
+    }
+    if parts.is_empty() { None } else { Some(parts.join(", ")) }
+}
+
+fn fetch_subscription_inner(
+    url: &str,
+    user_agent: &str,
+    send_hwid: bool,
+    proxy_port: Option<u16>,
+) -> Result<SubscriptionResponse, String> {
     let trimmed = url.trim();
     if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
         return Err("URL must start with https:// or http://".to_string());
@@ -65,13 +263,12 @@ pub fn fetch_subscription(url: &str, user_agent: &str) -> Result<SubscriptionRes
             user_agent.trim()
         };
         let ua = to_wide(ua_str);
-        let h_session = WinHttpOpen(
-            ua.as_ptr(),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            null(),
-            null(),
-            0,
-        );
+        let w_proxy = proxy_port.map(|p| to_wide(&format!("127.0.0.1:{}", p)));
+        let (access_type, proxy_ptr) = match w_proxy {
+            Some(ref wp) => (WINHTTP_ACCESS_TYPE_NAMED_PROXY, wp.as_ptr()),
+            None => (WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, null()),
+        };
+        let h_session = WinHttpOpen(ua.as_ptr(), access_type, proxy_ptr, null(), 0);
         if h_session.is_null() {
             return Err("WinHttpOpen failed".to_string());
         }
@@ -104,7 +301,16 @@ pub fn fetch_subscription(url: &str, user_agent: &str) -> Result<SubscriptionRes
             return Err("WinHttpOpenRequest failed".to_string());
         }
 
-        let sent = WinHttpSendRequest(h_req, null(), 0, null(), 0, 0, 0);
+        let w_hdrs = if send_hwid {
+            Some(to_wide(&build_hwid_headers()))
+        } else {
+            None
+        };
+        let (hdr_ptr, hdr_len) = match w_hdrs {
+            Some(ref wh) => (wh.as_ptr(), wh.len().saturating_sub(1) as u32),
+            None => (null(), 0),
+        };
+        let sent = WinHttpSendRequest(h_req, hdr_ptr, hdr_len, null(), 0, 0, 0);
         if sent == 0 || WinHttpReceiveResponse(h_req, null_mut()) == 0 {
             WinHttpCloseHandle(h_req);
             WinHttpCloseHandle(h_connect);
@@ -128,6 +334,15 @@ pub fn fetch_subscription(url: &str, user_agent: &str) -> Result<SubscriptionRes
             WinHttpCloseHandle(h_session);
             return Err(format!("Subscription server returned HTTP {}", status_code));
         }
+
+        let profile_title =
+            query_custom_header(h_req, "profile-title").map(|s| decode_profile_title(&s));
+        let update_interval_hours = query_custom_header(h_req, "profile-update-interval")
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&h| h > 0)
+            .map(|h| h.clamp(1, 720));
+        let userinfo = query_custom_header(h_req, "subscription-userinfo")
+            .and_then(|s| format_subscription_userinfo(&s));
 
         let mut body_bytes: Vec<u8> = Vec::new();
         loop {
@@ -173,70 +388,13 @@ pub fn fetch_subscription(url: &str, user_agent: &str) -> Result<SubscriptionRes
         WinHttpCloseHandle(h_session);
 
         let body = String::from_utf8_lossy(&body_bytes).into_owned();
-        Ok(SubscriptionResponse { body })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LivePingStats {
-    pub rtt_ms: u32,
-    pub jitter_ms: u32,
-    pub loss_pct: u8,
-}
-
-impl LivePingStats {
-    pub fn quality_label(&self) -> &'static str {
-        if self.loss_pct >= 100 {
-            "Down"
-        } else if self.loss_pct == 0 && self.rtt_ms <= 100 && self.jitter_ms <= 15 {
-            "Good"
-        } else if self.loss_pct <= 10 && self.rtt_ms <= 180 && self.jitter_ms <= 35 {
-            "Fair"
-        } else {
-            "Poor"
-        }
-    }
-
-    pub fn format_status(&self) -> String {
-        if self.loss_pct >= 100 {
-            "Down (100% loss)".to_string()
-        } else {
-            format!(
-                "{}ms ±{}ms {}% ({})",
-                self.rtt_ms,
-                self.jitter_ms,
-                self.loss_pct,
-                self.quality_label()
-            )
-        }
-    }
-}
-
-fn summarize_live_window(window: &VecDeque<Option<u32>>) -> LivePingStats {
-    let total = window.len();
-    let ok: Vec<u32> = window.iter().filter_map(|&v| v).collect();
-    if total == 0 || ok.is_empty() {
-        return LivePingStats {
-            rtt_ms: 0,
-            jitter_ms: 0,
-            loss_pct: 100,
-        };
-    }
-    let failed = total.saturating_sub(ok.len());
-    let loss_pct = ((failed * 100 + total / 2) / total).min(100) as u8;
-    let sum: u64 = ok.iter().map(|&v| v as u64).sum();
-    let rtt_ms = ((sum + (ok.len() as u64) / 2) / (ok.len() as u64)) as u32;
-    let jitter_ms = if ok.len() >= 2 {
-        let diff_sum: u64 = ok.windows(2).map(|w| w[0].abs_diff(w[1]) as u64).sum();
-        let cnt = (ok.len() - 1) as u64;
-        ((diff_sum + cnt / 2) / cnt) as u32
-    } else {
-        0
-    };
-    LivePingStats {
-        rtt_ms,
-        jitter_ms,
-        loss_pct,
+        Ok(SubscriptionResponse {
+            body,
+            profile_title,
+            update_interval_hours,
+            userinfo,
+            via_proxy: false,
+        })
     }
 }
 
@@ -276,7 +434,6 @@ unsafe fn probe_once_on_connect(
         &mut status_len,
         null_mut(),
     );
-    // Drain any unread bytes (0 on 204) so WinHTTP returns the TLS socket to its keep-alive pool.
     let mut avail: u32 = 0;
     while WinHttpQueryDataAvailable(h_req, &mut avail) != 0 && avail > 0 {
         let mut sink = [0u8; 512];
@@ -295,98 +452,65 @@ unsafe fn probe_once_on_connect(
     }
 }
 
-// Keep a single persistent HTTPS keep-alive tunnel open through the local HTTP inbound
-// so each probe measures pure 1-RTT latency, jitter, and packet loss in real time.
-pub fn spawn_live_tunnel_monitor(
+// End-to-end Real Delay probe through a local Xray HTTP inbound (warm-up + 1-RTT /generate_204).
+pub fn probe_http_proxy_real_delay(
     http_port: u16,
-    stop: Arc<AtomicBool>,
-    on_update: impl Fn(LivePingStats) + Send + 'static,
-) {
-    std::thread::spawn(move || {
-        // Brief settle wait after Xray starts
-        for _ in 0..4 {
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(80));
+    initial_delay_ms: u64,
+    cancel: &AtomicBool,
+) -> u32 {
+    let mut rem = initial_delay_ms;
+    while rem > 0 && !cancel.load(Ordering::Relaxed) {
+        let step = rem.min(30);
+        std::thread::sleep(Duration::from_millis(step));
+        rem -= step;
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return 0;
+    }
+
+    let ua = to_wide("Avel/1.0");
+    let proxy = to_wide(&format!("127.0.0.1:{}", http_port));
+    let host = to_wide("www.gstatic.com");
+    let w_method = to_wide("GET");
+    let w_path = to_wide("/generate_204");
+
+    unsafe {
+        let h_session = WinHttpOpen(
+            ua.as_ptr(),
+            WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+            proxy.as_ptr(),
+            null(),
+            0,
+        );
+        if h_session.is_null() {
+            return 0;
         }
-
-        let ua = to_wide("Avel/1.0");
-        let proxy = to_wide(&format!("127.0.0.1:{}", http_port));
-        let host = to_wide("www.gstatic.com");
-        let w_method = to_wide("GET");
-        let w_path = to_wide("/generate_204");
-
-        let mut window: VecDeque<Option<u32>> = VecDeque::with_capacity(12);
-        let mut warmed_up = false;
-
-        unsafe {
-            let h_session = WinHttpOpen(
-                ua.as_ptr(),
-                WINHTTP_ACCESS_TYPE_NAMED_PROXY,
-                proxy.as_ptr(),
-                null(),
-                0,
-            );
-            if h_session.is_null() {
-                return;
-            }
-            WinHttpSetTimeouts(h_session, 3000, 4000, 4000, 4500);
-
-            let mut h_connect = WinHttpConnect(h_session, host.as_ptr(), 443, 0);
-
-            while !stop.load(Ordering::Relaxed) {
-                if h_connect.is_null() {
-                    h_connect = WinHttpConnect(h_session, host.as_ptr(), 443, 0);
-                }
-
-                let sample = if h_connect.is_null() {
-                    None
-                } else {
-                    probe_once_on_connect(h_connect, &w_method, &w_path)
-                };
-
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                // First successful request pays TCP+TLS handshake; treat it as keep-alive warmup
-                // and immediately follow up with the first real 1-RTT sample.
-                if !warmed_up && sample.is_some() {
-                    warmed_up = true;
-                    std::thread::sleep(Duration::from_millis(120));
-                    continue;
-                }
-
-                if sample.is_none() {
-                    warmed_up = false;
-                    if !h_connect.is_null() {
-                        WinHttpCloseHandle(h_connect);
-                        h_connect = null_mut();
-                    }
-                }
-
-                if window.len() >= 12 {
-                    window.pop_front();
-                }
-                window.push_back(sample);
-                on_update(summarize_live_window(&window));
-
-                // Wait 2.5s between probes in short slices for instant stop on disconnect
-                for _ in 0..25 {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-
-            if !h_connect.is_null() {
-                WinHttpCloseHandle(h_connect);
-            }
+        WinHttpSetTimeouts(h_session, 3000, 3500, 3500, 4000);
+        let h_connect = WinHttpConnect(h_session, host.as_ptr(), 443, 0);
+        if h_connect.is_null() {
             WinHttpCloseHandle(h_session);
+            return 0;
         }
-    });
+
+        let first = probe_once_on_connect(h_connect, &w_method, &w_path);
+        let result = match first {
+            None => 0,
+            Some(t1) => {
+                if cancel.load(Ordering::Relaxed) {
+                    0
+                } else {
+                    match probe_once_on_connect(h_connect, &w_method, &w_path) {
+                        Some(t2) => t2.min(t1),
+                        None => t1,
+                    }
+                }
+            }
+        };
+
+        WinHttpCloseHandle(h_connect);
+        WinHttpCloseHandle(h_session);
+        result
+    }
 }
 
 const MAX_GEO_BYTES: usize = 32 * 1024 * 1024;
@@ -1036,22 +1160,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_ping_window_computes_quality_and_status() {
-        let w: VecDeque<Option<u32>> = vec![Some(46), Some(48), Some(47), Some(49)].into();
-        let st = summarize_live_window(&w);
-        assert_eq!(st.rtt_ms, 48);
-        assert_eq!(st.jitter_ms, 2);
-        assert_eq!(st.loss_pct, 0);
-        assert_eq!(st.quality_label(), "Good");
-        assert_eq!(st.format_status(), "48ms ±2ms 0% (Good)");
-
-        let down: VecDeque<Option<u32>> = vec![None, None, None].into();
-        let st_down = summarize_live_window(&down);
-        assert_eq!(st_down.quality_label(), "Down");
-        assert_eq!(st_down.format_status(), "Down (100% loss)");
-    }
-
-    #[test]
     fn sha256_and_semver_comparison_work() {
         let mut h = Sha256::new();
         h.update(b"abc");
@@ -1063,5 +1171,14 @@ mod tests {
         assert!(is_newer_version("0.1.1", "v0.2.0"));
         assert!(!is_newer_version("0.1.1", "v0.1.1"));
         assert!(!is_newer_version("0.1.1", "v0.1.0"));
+    }
+
+    #[test]
+    fn parses_profile_title_and_userinfo_headers() {
+        assert_eq!(decode_profile_title("base64:TXkgVlBO"), "My VPN");
+        assert_eq!(decode_profile_title("PlainTitle"), "PlainTitle");
+        let ui = format_subscription_userinfo("upload=1073741824; download=2147483648; total=107374182400; expire=0")
+            .unwrap();
+        assert_eq!(ui, "3.0 GB / 100 GB");
     }
 }
