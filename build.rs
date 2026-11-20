@@ -5,6 +5,7 @@ use std::path::PathBuf;
 // Generates a COFF .rsrc object with app icon sizes (16..64 px) and a Win11 PerMonitorV2 manifest.
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -37,9 +38,11 @@ fn main() {
         icon_payloads.push((id, dib));
     }
 
-    let manifest = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    let pkg_ver = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.2.0".to_string());
+    let manifest = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3">
-  <assemblyIdentity version="0.1.1.0" processorArchitecture="*" name="Avel.XrayClient" type="win32"/>
+  <assemblyIdentity version="{}.0" processorArchitecture="*" name="Avel.XrayClient" type="win32"/>
   <description>avel-xray Native Win32 VPN Client</description>
   <dependency>
     <dependentAssembly>
@@ -55,7 +58,7 @@ fn main() {
   </trustInfo>
   <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
     <application>
-      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <supportedOS Id="{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}"/>
     </application>
   </compatibility>
   <asmv3:application>
@@ -65,7 +68,9 @@ fn main() {
     </asmv3:windowsSettings>
   </asmv3:application>
 </assembly>
-"#;
+"#,
+        pkg_ver
+    );
 
     // Resource types MUST be sorted by ID ascending: RT_ICON=3, RT_GROUP_ICON=14, RT_MANIFEST=24
     let types: Vec<(u32, Vec<(u32, Vec<u8>)>)> = vec![
@@ -77,7 +82,7 @@ fn main() {
                 .collect(),
         ),
         (14, vec![(1, group_icon)]),
-        (24, vec![(1, manifest.to_vec())]),
+        (24, vec![(1, manifest.into_bytes())]),
     ];
 
     let coff = build_rsrc_coff_amd64(&types);
