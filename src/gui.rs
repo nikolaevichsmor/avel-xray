@@ -226,7 +226,7 @@ struct AppContext {
     state: AppState,
     runner: XrayRunner,
     connected: bool,
-    connected_node_key: Option<(String, String, u16)>,
+    connected_node_key: Option<(String, String, String, u16, String, String, String, String)>,
     was_connected_before_sleep: bool,
     is_admin: bool,
     exiting: bool,
@@ -239,6 +239,7 @@ struct AppContext {
     active_sub_id: Option<String>,
     sub_combo_ids: Vec<String>,
     sub_retry_after: HashMap<String, u64>,
+    tcp_ping_cancel: Option<Arc<AtomicBool>>,
     ping_gen: u32,
     real_ping_cancel: Option<Arc<AtomicBool>>,
     real_ping_gen: u32,
@@ -476,6 +477,7 @@ pub fn run_app(start_minimized: bool, autoconnect: bool) {
             active_sub_id: None,
             sub_combo_ids: Vec::new(),
             sub_retry_after: HashMap::new(),
+            tcp_ping_cancel: None,
             ping_gen: 0,
             real_ping_cancel: None,
             real_ping_gen: 0,
@@ -1044,6 +1046,10 @@ impl AppContext {
         }
         let type_idx = SendMessageW(self.h_combo_rule_type, CB_GETCURSEL, 0, 0) as i32;
         let kind = RuleMatchKind::from_index(type_idx);
+        let val = crate::xray_config::clean_rule_input(kind, &val);
+        if val.is_empty() {
+            return;
+        }
         let tgt_idx = SendMessageW(self.h_combo_rule_target, CB_GETCURSEL, 0, 0) as usize;
         let target = self
             .rule_target_values
@@ -1861,7 +1867,7 @@ impl AppContext {
 
         if added > 0 {
             self.cancel_real_ping();
-            self.ping_gen = self.ping_gen.wrapping_add(1);
+            self.cancel_tcp_ping();
             self.state.selected_index = first_new_idx;
             let _ = self.state.save();
             self.rebuild_node_list();
@@ -2041,7 +2047,7 @@ impl AppContext {
         }
 
         self.cancel_real_ping();
-        self.ping_gen = self.ping_gen.wrapping_add(1);
+        self.cancel_tcp_ping();
         self.state.subscriptions.retain(|s| s.id != sub.id);
         self.state
             .nodes
@@ -2084,6 +2090,17 @@ impl AppContext {
         }
     }
 
+    unsafe fn cancel_tcp_ping(&mut self) {
+        if let Some(cancel) = self.tcp_ping_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.ping_gen = self.ping_gen.wrapping_add(1);
+        if !self.h_btn_ping.is_null() {
+            EnableWindow(self.h_btn_ping, 1);
+            set_text(self.h_btn_ping, "TCP Ping");
+        }
+    }
+
     unsafe fn cancel_real_ping(&mut self) {
         if let Some(cancel) = self.real_ping_cancel.take() {
             cancel.store(true, Ordering::Relaxed);
@@ -2102,26 +2119,32 @@ impl AppContext {
         }
     }
 
-    unsafe fn on_ping_all(&mut self) {
-        if self.state.nodes.is_empty() {
+    unsafe fn start_tcp_ping_targets(&mut self, targets: Vec<(usize, String, u16)>, desc: &str) {
+        if targets.is_empty() {
             return;
         }
+        self.cancel_real_ping();
+        self.cancel_tcp_ping();
         if self.connected && self.state.mode == ProxyMode::Tun && self.state.kill_switch {
             self.append_log(
                 "Note: Kill-Switch (allexceptlan) blocks direct Wi-Fi TCP ping; disconnect first.",
             );
         }
-        self.ping_gen = self.ping_gen.wrapping_add(1);
         let gen = self.ping_gen;
-        EnableWindow(self.h_btn_ping, 0);
-        set_text(self.h_btn_ping, "Pinging...");
-        self.append_log("Running TCP ping on all servers...");
-        let targets = extract_ping_targets(&self.state.nodes);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.tcp_ping_cancel = Some(cancel.clone());
+        EnableWindow(self.h_btn_ping, 1);
+        set_text(self.h_btn_ping, "Stop");
+        self.append_log(&format!("Running TCP ping on {}...", desc));
+
+        let tun_active = self.connected && self.state.mode == ProxyMode::Tun;
         let tx1 = self.ev_tx.clone();
         let tx2 = self.ev_tx.clone();
         let hwnd_raw = self.hwnd as usize;
         ping_all_async(
             targets,
+            tun_active,
+            cancel,
             move |idx, ms| {
                 let _ = tx1.send(UiEvent::PingResult(gen, idx, ms));
                 PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
@@ -2133,6 +2156,19 @@ impl AppContext {
         );
     }
 
+    unsafe fn on_ping_all(&mut self) {
+        if self.tcp_ping_cancel.is_some() {
+            self.cancel_tcp_ping();
+            self.append_log("TCP ping cancelled.");
+            return;
+        }
+        if self.state.nodes.is_empty() {
+            return;
+        }
+        let targets = extract_ping_targets(&self.state.nodes);
+        self.start_tcp_ping_targets(targets, "all servers");
+    }
+
     unsafe fn on_ping_single(&mut self, idx: usize) {
         let Some((name, addr, port)) = self
             .state
@@ -2142,35 +2178,14 @@ impl AppContext {
         else {
             return;
         };
-        if self.connected && self.state.mode == ProxyMode::Tun && self.state.kill_switch {
-            self.append_log(
-                "Note: Kill-Switch (allexceptlan) blocks direct Wi-Fi TCP ping; disconnect first.",
-            );
-        }
-        self.ping_gen = self.ping_gen.wrapping_add(1);
-        let gen = self.ping_gen;
-        let targets = vec![(idx, addr, port)];
-        self.append_log(&format!("Running TCP ping on {}...", name));
-        let tx1 = self.ev_tx.clone();
-        let tx2 = self.ev_tx.clone();
-        let hwnd_raw = self.hwnd as usize;
-        ping_all_async(
-            targets,
-            move |i, ms| {
-                let _ = tx1.send(UiEvent::PingResult(gen, i, ms));
-                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
-            },
-            move || {
-                let _ = tx2.send(UiEvent::PingFinished(gen));
-                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
-            },
-        );
+        self.start_tcp_ping_targets(vec![(idx, addr, port)], &name);
     }
 
     unsafe fn start_real_ping_nodes(&mut self, items: Vec<(usize, VlessNode)>, desc: &str) {
         if items.is_empty() {
             return;
         }
+        self.cancel_tcp_ping();
         self.cancel_real_ping();
         if self.connected && self.state.mode == ProxyMode::Tun && self.state.kill_switch {
             self.append_log(
@@ -2316,6 +2331,18 @@ impl AppContext {
         if node.allow_insecure {
             self.append_log("Note: Server URI specifies allowInsecure=1 (removed in Xray 26.x; strict TLS verification is enforced).");
         }
+        if self.state.mode == ProxyMode::Tun && !self.state.enable_sniffing {
+            let has_domain_rules = self.state.routing == RoutingPreset::DirectLanAndRu
+                || (self.state.routing == RoutingPreset::Custom
+                    && self
+                        .state
+                        .custom_rules
+                        .iter()
+                        .any(|r| r.enabled && r.kind == RuleMatchKind::Domain));
+            if has_domain_rules {
+                self.append_log("Warning: Sniffing is disabled in Settings; Domain/GeoSite routing rules will NOT match in TUN mode.");
+            }
+        }
 
         let cfg = match build_xray_config(&self.state, &node) {
             Ok(c) => c,
@@ -2334,6 +2361,7 @@ impl AppContext {
         std::thread::spawn(move || {
             for line in raw_rx {
                 let _ = tx_log.send(UiEvent::LogLine(line));
+                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
             }
         });
 
@@ -2346,9 +2374,7 @@ impl AppContext {
                 is_tun: self.state.mode == ProxyMode::Tun,
             },
             raw_tx,
-            move || {
-                PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
-            },
+            || {},
             move |exited_pid| {
                 let _ = tx_exit.send(UiEvent::XrayExited(exited_pid));
                 PostMessageW(hwnd_raw as HWND, WM_UI_EVENT, 0, 0);
@@ -2386,7 +2412,7 @@ impl AppContext {
                     SetTimer(self.hwnd, TIMER_STATS, 1000, None);
                 }
                 self.connected = true;
-                self.connected_node_key = Some((node.uuid.clone(), node.address.clone(), node.port));
+                self.connected_node_key = Some(node.identity_key());
                 InvalidateRect(self.h_list_nodes, null(), 1);
                 self.clear_traffic_stats();
                 let _ = self.state.save();
@@ -2575,7 +2601,7 @@ impl AppContext {
                                 .unwrap_or(0);
                             self.state.selected_index = preserved_idx;
                             self.cancel_real_ping();
-                            self.ping_gen = self.ping_gen.wrapping_add(1);
+                            self.cancel_tcp_ping();
                             let _ = self.state.save();
                             self.rebuild_sub_combo();
                             self.rebuild_node_list_with_sel(if silent { had_sel } else { true });
@@ -2634,6 +2660,7 @@ impl AppContext {
                 }
                 UiEvent::PingFinished(gen) => {
                     if gen == self.ping_gen {
+                        self.tcp_ping_cancel = None;
                         EnableWindow(self.h_btn_ping, 1);
                         set_text(self.h_btn_ping, "TCP Ping");
                         self.append_log("TCP ping finished.");
@@ -2797,7 +2824,7 @@ impl AppContext {
             return;
         };
         self.cancel_real_ping();
-        self.ping_gen = self.ping_gen.wrapping_add(1);
+        self.cancel_tcp_ping();
         self.state.nodes.remove(idx);
         if self.state.selected_index >= self.state.nodes.len() && !self.state.nodes.is_empty() {
             self.state.selected_index = self.state.nodes.len() - 1;
@@ -2991,6 +3018,7 @@ impl AppContext {
 
     unsafe fn full_exit(&mut self) {
         self.exiting = true;
+        self.cancel_tcp_ping();
         self.cancel_real_ping();
         self.disconnect();
         let _ = self.state.save();
@@ -3069,7 +3097,7 @@ impl AppContext {
             && self
                 .connected_node_key
                 .as_ref()
-                .map(|(u, a, p)| u == &node.uuid && a == &node.address && *p == node.port)
+                .map(|k| *k == node.identity_key())
                 .unwrap_or(false);
 
         let pad_x = scale_dpi(6, self.dpi);
@@ -3459,7 +3487,7 @@ unsafe extern "system" fn wnd_proc(
                             .state
                             .nodes
                             .get(idx)
-                            .map(|n| (n.uuid.clone(), n.address.clone(), n.port));
+                            .map(|n| n.identity_key());
                         if !(ctx.connected
                             && clicked_key.is_some()
                             && ctx.connected_node_key == clicked_key)
@@ -3503,7 +3531,7 @@ unsafe extern "system" fn wnd_proc(
                                 .state
                                 .nodes
                                 .get(idx)
-                                .map(|n| (n.uuid.clone(), n.address.clone(), n.port));
+                                .map(|n| n.identity_key());
                             if ctx.connected && clicked_key.is_some() && ctx.connected_node_key == clicked_key {
                                 return 0;
                             }
