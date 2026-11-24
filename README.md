@@ -11,7 +11,7 @@
   <a href="https://www.wintun.net/"><img src="https://img.shields.io/badge/TUN-Wintun-0EA5E9" alt="TUN"></a>
 </p>
 
-Native Win32 VPN client for Xray-core on Windows x64, written in Rust directly against the Windows API.
+Native Rust VPN client for Xray-core: Win32 GUI on Windows x64 and interactive Terminal UI (TUI) + CLI on Linux x64.
 
 ## Why avel-xray?
 
@@ -29,6 +29,8 @@ Supports **VLESS** (Reality, TLS, XHTTP / SplitHTTP, WebSocket, gRPC, HTTPUpgrad
 
 ## Download
 
+### Windows x64 (GUI)
+
 1. Download `avel-xray-<version>-windows-x64.zip` from [Releases](https://github.com/nikolaevichsmor/avel-xray/releases).
 2. Extract to any folder and run `avel.exe` (portable, no installer).
 3. Paste a subscription URL or proxy link (`vless://`, `vmess://`, `trojan://`, `ss://`, `hy2://`, `wireguard://`, `socks5://`, `http://`), click **Update** or **Add** (or press `Ctrl+V` in the server list), pick a server, and click **Connect**.
@@ -36,22 +38,43 @@ Supports **VLESS** (Reality, TLS, XHTTP / SplitHTTP, WebSocket, gRPC, HTTPUpgrad
 > [!NOTE]
 > **System Proxy** works with standard user permissions. Switching to **TUN mode** automatically requests UAC elevation once; enabling **Autostart** while elevated registers a silent logon task with no UAC prompt on reboot.
 
+### Linux x64 (TUI & CLI)
+
+1. Download `avel-xray-<version>-linux-x64.tar.gz` from [Releases](https://github.com/nikolaevichsmor/avel-xray/releases) and extract it:
+
+```bash
+tar -xzf avel-xray-<version>-linux-x64.tar.gz
+cd avel-xray
+./avel          # interactive Terminal UI (use `sudo ./avel` for TUN mode)
+```
+
+2. Scriptable CLI commands are also available:
+
+```bash
+./avel sub add <url>
+./avel list
+./avel ping --real
+./avel connect --proxy
+sudo ./avel connect --tun
+./avel geo update
+```
+
 ## Build from source
 
-Requirements: Windows x64 and the Rust toolchain (`rustup`).
+Requirements: Rust toolchain (`rustup`).
 
 1. Place runtime files into `core/`:
-   - `avel-core.exe` (official `xray.exe` from [XTLS/Xray-core](https://github.com/XTLS/Xray-core/releases))
-   - `wintun.dll` (amd64 build from [wintun.net](https://www.wintun.net/))
-   - `geoip.dat` and `geosite.dat` (from Xray-core release or [XTLS/Xray-rules-dat](https://github.com/XTLS/Xray-rules-dat))
+   - Windows: `avel-core.exe` (official `xray.exe` from [XTLS/Xray-core](https://github.com/XTLS/Xray-core/releases)) and `wintun.dll` (amd64 build from [wintun.net](https://www.wintun.net/))
+   - Linux: `avel-core` (official `xray` binary from [XTLS/Xray-core](https://github.com/XTLS/Xray-core/releases), `chmod +x`)
+   - Both: `geoip.dat` and `geosite.dat` (from Xray-core release or [XTLS/Xray-rules-dat](https://github.com/XTLS/Xray-rules-dat))
 2. Run tests and build:
 
-```powershell
+```bash
 cargo test
 cargo build --release
 ```
 
-Copy `target/release/avel.exe` next to the `core/` folder.
+Copy `target/release/avel.exe` (Windows) or `target/release/avel` (Linux) next to the `core/` folder.
 
 ## License
 
