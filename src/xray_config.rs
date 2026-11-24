@@ -6,7 +6,38 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::IpAddr;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum TargetPlatform {
+    Windows,
+    Linux,
+}
+
+impl TargetPlatform {
+    #[allow(dead_code)]
+    pub fn current() -> Self {
+        #[cfg(windows)]
+        {
+            TargetPlatform::Windows
+        }
+        #[cfg(not(windows))]
+        {
+            TargetPlatform::Linux
+        }
+    }
+}
+
+#[allow(dead_code)]
 pub fn build_xray_config(state: &AppState, node: &VlessNode) -> Result<String, String> {
+    build_xray_config_for(state, node, TargetPlatform::current(), false)
+}
+
+pub fn build_xray_config_for(
+    state: &AppState,
+    node: &VlessNode,
+    platform: TargetPlatform,
+    linux_auto_dns: bool,
+) -> Result<String, String> {
     // Resolve any additional servers referenced by enabled custom routing rules (multi-outbound)
     let mut extra_node_tags: HashMap<usize, String> = HashMap::new();
     let mut referenced_nodes: Vec<&VlessNode> = vec![node];
@@ -20,10 +51,7 @@ pub fn build_xray_config(state: &AppState, node: &VlessNode) -> Result<String, S
                     .enumerate()
                     .find(|(_, n)| n.name == target_name)
                 {
-                    let same_as_active = n.uuid == node.uuid
-                        && n.address == node.address
-                        && n.port == node.port
-                        && n.protocol == node.protocol;
+                    let same_as_active = n.identity_key() == node.identity_key();
                     if !same_as_active && !extra_node_tags.contains_key(&idx) {
                         extra_node_tags.insert(idx, format!("node-{}", idx));
                         referenced_nodes.push(n);
@@ -146,28 +174,48 @@ pub fn build_xray_config(state: &AppState, node: &VlessNode) -> Result<String, S
     ];
 
     if state.mode == ProxyMode::Tun {
-        // IPv4-only TUN subnet with private peer DNS (172.21.0.2).
-        // Kill-Switch enables Xray 26.11.9+ WFP "allexceptlan" (blocks all non-LAN traffic outside TUN).
-        let wfp_block = if state.kill_switch {
-            json!(["allexceptlan"])
-        } else {
-            json!(["dns", "misconfigtun"])
-        };
         let tun_mtu = state.tun_mtu.clamp(1280, 9000);
+        let tun_settings = match platform {
+            TargetPlatform::Windows => {
+                // IPv4-only TUN subnet with private peer DNS (172.21.0.2).
+                // Kill-Switch enables Xray 26.11.9+ WFP "allexceptlan" (blocks all non-LAN traffic outside TUN).
+                let wfp_block = if state.kill_switch {
+                    json!(["allexceptlan"])
+                } else {
+                    json!(["dns", "misconfigtun"])
+                };
+                json!({
+                    "name": "avel0",
+                    "desc": "Avel",
+                    "mtu": tun_mtu,
+                    "gateway": ["172.21.0.1/30"],
+                    "dns": ["172.21.0.2"],
+                    "userLevel": 0,
+                    "autoSystemRoutingTable": ["0.0.0.0/0"],
+                    "autoOutboundsInterface": "auto",
+                    "autoSystemWfpBlockLeak": wfp_block
+                })
+            }
+            TargetPlatform::Linux => {
+                let mut s = json!({
+                    "name": "avel0",
+                    "mtu": tun_mtu,
+                    "gateway": ["172.21.0.1/30"],
+                    "dns": ["172.21.0.2"],
+                    "userLevel": 0,
+                    "autoSystemRoutingTable": ["0.0.0.0/0"],
+                    "autoOutboundsInterface": "auto"
+                });
+                if linux_auto_dns {
+                    s["autoSystemDnsToGateway"] = json!(true);
+                }
+                s
+            }
+        };
         inbounds.push(json!({
             "tag": "tun-in",
             "protocol": "tun",
-            "settings": {
-                "name": "avel0",
-                "desc": "Avel",
-                "mtu": tun_mtu,
-                "gateway": ["172.21.0.1/30"],
-                "dns": ["172.21.0.2"],
-                "userLevel": 0,
-                "autoSystemRoutingTable": ["0.0.0.0/0"],
-                "autoOutboundsInterface": "auto",
-                "autoSystemWfpBlockLeak": wfp_block
-            },
+            "settings": tun_settings,
             "sniffing": sniffing
         }));
     }
@@ -437,10 +485,37 @@ pub fn build_batch_test_config(
         return Err("No valid server configurations in batch.".to_string());
     }
 
+    let mut dns_direct = json!({
+        "tag": "dns-direct",
+        "protocol": "freedom",
+        "streamSettings": {
+            "sockopt": {
+                "domainStrategy": "UseIPv4"
+            }
+        }
+    });
+    if let Some(iface) = bind_interface.filter(|s| !s.is_empty()) {
+        dns_direct["streamSettings"]["sockopt"]["interface"] = json!(iface);
+    }
+    outbounds.push(dns_direct);
+    rules.push(json!({
+        "type": "field",
+        "inboundTag": ["dns-in"],
+        "outboundTag": "dns-direct"
+    }));
+
     let cfg = json!({
         "log": {
             "access": "none",
             "loglevel": "none"
+        },
+        "dns": {
+            "tag": "dns-in",
+            "servers": [
+                "https://8.8.4.4/dns-query",
+                "tcp://8.8.4.4:53"
+            ],
+            "queryStrategy": "UseIPv4"
         },
         "inbounds": inbounds,
         "outbounds": outbounds,
@@ -532,11 +607,7 @@ fn resolve_rule_target(
         other => {
             if let Some(name) = other.strip_prefix("node:") {
                 if let Some((idx, n)) = state.nodes.iter().enumerate().find(|(_, n)| n.name == name) {
-                    if n.uuid == active_node.uuid
-                        && n.address == active_node.address
-                        && n.port == active_node.port
-                        && n.protocol == active_node.protocol
-                    {
+                    if n.identity_key() == active_node.identity_key() {
                         return "proxy".to_string();
                     }
                     if let Some(tag) = extra_tags.get(&idx) {
@@ -549,20 +620,80 @@ fn resolve_rule_target(
     }
 }
 
+fn clean_domain_item(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("geosite:")
+        || trimmed.starts_with("domain:")
+        || trimmed.starts_with("full:")
+        || trimmed.starts_with("regexp:")
+        || trimmed.starts_with("keyword:")
+    {
+        return trimmed.to_string();
+    }
+    // Strip accidental URL schemes, paths/queries/fragments, ports, wildcards, and leading "www."
+    let lower_scheme = trimmed.to_ascii_lowercase();
+    let s = if lower_scheme.starts_with("https://") {
+        &trimmed[8..]
+    } else if lower_scheme.starts_with("http://") {
+        &trimmed[7..]
+    } else {
+        trimmed
+    };
+    let host = s
+        .split(|c| c == '/' || c == '?' || c == '#')
+        .next()
+        .unwrap_or(s);
+    let host = host.split(':').next().unwrap_or(host);
+    let host = host
+        .trim_start_matches("*.")
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .trim();
+    let lower_host = host.to_ascii_lowercase();
+    let cleaned = if let Some(rest) = lower_host.strip_prefix("www.") {
+        if rest.contains('.') {
+            rest.to_string()
+        } else {
+            lower_host
+        }
+    } else {
+        lower_host
+    };
+    if cleaned.is_empty() {
+        trimmed.to_string()
+    } else {
+        cleaned
+    }
+}
+
+pub fn clean_rule_input(kind: RuleMatchKind, raw: &str) -> String {
+    match kind {
+        RuleMatchKind::Domain => raw
+            .split(|c| c == ',' || c == ';')
+            .map(clean_domain_item)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(", "),
+        RuleMatchKind::Process | RuleMatchKind::Ip => raw.trim().to_string(),
+    }
+}
+
 fn normalize_rule_item(kind: RuleMatchKind, raw: &str) -> String {
     match kind {
         RuleMatchKind::Process => raw.to_string(),
         RuleMatchKind::Ip => raw.to_string(),
         RuleMatchKind::Domain => {
-            if raw.starts_with("geosite:")
-                || raw.starts_with("domain:")
-                || raw.starts_with("full:")
-                || raw.starts_with("regexp:")
-                || raw.starts_with("keyword:")
+            let cleaned = clean_domain_item(raw);
+            if cleaned.starts_with("geosite:")
+                || cleaned.starts_with("domain:")
+                || cleaned.starts_with("full:")
+                || cleaned.starts_with("regexp:")
+                || cleaned.starts_with("keyword:")
             {
-                raw.to_string()
+                cleaned
             } else {
-                format!("domain:{}", raw)
+                format!("domain:{}", cleaned)
             }
         }
     }
@@ -1043,17 +1174,21 @@ mod tests {
     use std::process::Command;
 
     fn resolve_test_core_bin(core: &PathBuf) -> PathBuf {
-        let preferred = core.join("avel-core.exe");
+        #[cfg(windows)]
+        let (pref, leg) = ("avel-core.exe", "xray.exe");
+        #[cfg(not(windows))]
+        let (pref, leg) = ("avel-core", "xray");
+        let preferred = core.join(pref);
         if preferred.exists() {
             preferred
         } else {
-            core.join("xray.exe")
+            core.join(leg)
         }
     }
 
     fn run_xray_test(core: &PathBuf, name: &str, cfg_json: &str) {
         let xray = resolve_test_core_bin(core);
-        assert!(xray.exists(), "avel-core.exe (or xray.exe) must exist in core/");
+        assert!(xray.exists(), "avel-core (or xray) binary must exist in core/");
         let tmp = core.join(format!("_ut_{}.json", name));
         std::fs::write(&tmp, cfg_json).unwrap();
         let out = Command::new(&xray)
@@ -1181,8 +1316,17 @@ mod tests {
         assert!(!cfg_global.contains("geoip:"));
         assert!(!cfg_global.contains("geosite:"));
         assert!(!cfg_global.contains("77.88.8.8"));
+        #[cfg(windows)]
         assert!(cfg_global.contains("allexceptlan"));
         run_xray_test(&core, "global_killswitch", &cfg_global);
+
+        let cfg_linux = build_xray_config_for(&st_global, &node, TargetPlatform::Linux, true).unwrap();
+        assert!(!cfg_linux.contains("autoSystemWfpBlockLeak"));
+        assert!(!cfg_linux.contains("\"desc\""));
+        assert!(cfg_linux.contains("\"autoSystemDnsToGateway\": true"));
+        assert!(cfg_linux.contains("\"autoOutboundsInterface\": \"auto\""));
+        #[cfg(not(windows))]
+        run_xray_test(&core, "linux_tun_auto_dns", &cfg_linux);
 
         // DirectLanAndRu includes scoped RU GeoDNS and geoip/geosite RU rules
         for mode in [ProxyMode::SystemProxy, ProxyMode::Tun] {
@@ -1308,6 +1452,38 @@ mod tests {
         assert!(cfg_sniff_off.contains("\"enabled\": false"));
         assert!(!cfg_sniff_off.contains("\"destOverride\""));
         run_xray_test(&core, "sniffing_disabled", &cfg_sniff_off);
+
+        assert_eq!(
+            normalize_rule_item(RuleMatchKind::Domain, "https://www.youtube.com/watch?v=1"),
+            "domain:youtube.com"
+        );
+        assert_eq!(
+            normalize_rule_item(RuleMatchKind::Domain, "www.example.com"),
+            "domain:example.com"
+        );
+        assert_eq!(
+            normalize_rule_item(RuleMatchKind::Domain, "full:www.example.com"),
+            "full:www.example.com"
+        );
+        assert_eq!(
+            normalize_rule_item(RuleMatchKind::Domain, "www.com"),
+            "domain:www.com"
+        );
+        assert_eq!(
+            normalize_rule_item(RuleMatchKind::Domain, "*.youtube.com"),
+            "domain:youtube.com"
+        );
+        assert_eq!(
+            normalize_rule_item(RuleMatchKind::Domain, "geosite:youtube"),
+            "geosite:youtube"
+        );
+        assert_eq!(
+            clean_rule_input(
+                RuleMatchKind::Domain,
+                "https://www.youtube.com/, geosite:google, *.doubleclick.net"
+            ),
+            "youtube.com, geosite:google, doubleclick.net"
+        );
     }
 
     #[test]
