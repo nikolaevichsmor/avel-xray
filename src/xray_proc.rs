@@ -9,7 +9,7 @@ use std::ptr::null_mut;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE,
@@ -311,16 +311,56 @@ impl Drop for XrayRunner {
 
 static TEMP_CFG_SEQ: AtomicU32 = AtomicU32::new(1);
 
-// Ephemeral background Xray instance for Real Delay probing; auto-killed via Job Object on Drop.
-pub struct TempXrayProcess {
+struct TempCoreHandles {
     child: Option<Child>,
     job: HANDLE,
+}
+
+unsafe impl Send for TempCoreHandles {}
+
+impl TempCoreHandles {
+    fn kill_and_close(&mut self) {
+        if let Some(mut ch) = self.child.take() {
+            let _ = ch.kill();
+            let _ = ch.wait();
+        }
+        if !self.job.is_null() {
+            unsafe {
+                CloseHandle(self.job);
+            }
+            self.job = null_mut();
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TempCoreKiller {
+    handles: Arc<Mutex<TempCoreHandles>>,
+}
+
+impl TempCoreKiller {
+    pub fn kill_now(&self) {
+        if let Ok(mut guard) = self.handles.lock() {
+            guard.kill_and_close();
+        }
+    }
+}
+
+// Ephemeral background Xray instance for Real Delay probing; auto-killed via Job Object on Drop.
+pub struct TempXrayProcess {
+    handles: Arc<Mutex<TempCoreHandles>>,
     cfg_path: PathBuf,
 }
 
 unsafe impl Send for TempXrayProcess {}
 
 impl TempXrayProcess {
+    pub fn killer(&self) -> TempCoreKiller {
+        TempCoreKiller {
+            handles: self.handles.clone(),
+        }
+    }
+
     pub fn start(
         config_json: &str,
         ready_port: u16,
@@ -370,9 +410,11 @@ impl TempXrayProcess {
             }
         }
 
-        let mut proc = Self {
-            child: Some(child),
-            job,
+        let proc = Self {
+            handles: Arc::new(Mutex::new(TempCoreHandles {
+                child: Some(child),
+                job,
+            })),
             cfg_path,
         };
 
@@ -384,9 +426,11 @@ impl TempXrayProcess {
             if TcpStream::connect_timeout(&addr, Duration::from_millis(60)).is_ok() {
                 return Ok(proc);
             }
-            if let Some(ref mut ch) = proc.child {
-                if let Ok(Some(_)) = ch.try_wait() {
-                    return Err("Test core exited before ready.".to_string());
+            if let Ok(mut guard) = proc.handles.lock() {
+                if let Some(ref mut ch) = guard.child {
+                    if let Ok(Some(_)) = ch.try_wait() {
+                        return Err("Test core exited before ready.".to_string());
+                    }
                 }
             }
             std::thread::sleep(Duration::from_millis(35));
@@ -398,15 +442,8 @@ impl TempXrayProcess {
 
 impl Drop for TempXrayProcess {
     fn drop(&mut self) {
-        if let Some(mut ch) = self.child.take() {
-            let _ = ch.kill();
-            let _ = ch.wait();
-        }
-        if !self.job.is_null() {
-            unsafe {
-                CloseHandle(self.job);
-            }
-            self.job = null_mut();
+        if let Ok(mut guard) = self.handles.lock() {
+            guard.kill_and_close();
         }
         let _ = std::fs::remove_file(&self.cfg_path);
     }
