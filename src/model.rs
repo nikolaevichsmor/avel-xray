@@ -61,6 +61,7 @@ pub enum RuleMatchKind {
 }
 
 impl RuleMatchKind {
+    #[cfg(windows)]
     pub fn from_index(idx: i32) -> Self {
         match idx {
             1 => RuleMatchKind::Domain,
@@ -400,6 +401,7 @@ impl VlessNode {
         }
     }
 
+    #[cfg(windows)]
     pub fn to_share_uri(&self) -> String {
         let raw = self.raw_uri.trim();
         if !raw.is_empty() && !raw.starts_with("vmess://") {
@@ -488,6 +490,20 @@ impl VlessNode {
         }
     }
 
+    pub fn identity_key(&self) -> (String, String, String, u16, String, String, String, String) {
+        (
+            self.protocol.clone(),
+            self.uuid.clone(),
+            self.address.clone(),
+            self.port,
+            self.network.clone(),
+            self.sni.clone(),
+            self.path.clone(),
+            self.service_name.clone(),
+        )
+    }
+
+    #[cfg(windows)]
     pub fn display_row(&self) -> String {
         let ping = match self.ping_ms {
             Some(0) => "timeout".to_string(),
@@ -498,6 +514,7 @@ impl VlessNode {
     }
 }
 
+#[cfg(windows)]
 fn percent_encode_fragment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -632,7 +649,14 @@ impl Default for AppState {
 
 fn has_core_binary(dir: &std::path::Path) -> bool {
     let c = dir.join("core");
-    c.join("avel-core.exe").exists() || c.join("xray.exe").exists()
+    #[cfg(windows)]
+    {
+        c.join("avel-core.exe").exists() || c.join("xray.exe").exists()
+    }
+    #[cfg(not(windows))]
+    {
+        c.join("avel-core").exists() || c.join("xray").exists()
+    }
 }
 
 pub fn app_base_dir() -> PathBuf {
@@ -651,7 +675,29 @@ pub fn app_base_dir() -> PathBuf {
                     return cwd;
                 }
             }
-            return dir.to_path_buf();
+            #[cfg(windows)]
+            {
+                return dir.to_path_buf();
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            let t = xdg.trim();
+            if !t.is_empty() {
+                let d = PathBuf::from(t).join("avel-xray");
+                let _ = std::fs::create_dir_all(&d);
+                return d;
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let t = home.trim();
+            if !t.is_empty() {
+                let d = PathBuf::from(t).join(".config").join("avel-xray");
+                let _ = std::fs::create_dir_all(&d);
+                return d;
+            }
         }
     }
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -669,22 +715,36 @@ pub fn core_dir() -> PathBuf {
     app_base_dir().join("core")
 }
 
-// Use core/avel-core.exe (auto-renaming xray.exe if present) to avoid image-name collisions
+// Use core/avel-core[.exe] (auto-renaming xray[.exe] if present) to avoid image-name collisions
 // with other local Xray instances or services.
 pub fn core_binary_path() -> Result<PathBuf, String> {
     let cdir = core_dir();
-    let preferred = cdir.join("avel-core.exe");
+    #[cfg(windows)]
+    let (pref_name, legacy_name) = ("avel-core.exe", "xray.exe");
+    #[cfg(not(windows))]
+    let (pref_name, legacy_name) = ("avel-core", "xray");
+
+    let preferred = cdir.join(pref_name);
     if preferred.exists() {
         return Ok(preferred);
     }
-    let legacy = cdir.join("xray.exe");
+    let legacy = cdir.join(legacy_name);
     if legacy.exists() {
         if std::fs::rename(&legacy, &preferred).is_ok() {
             return Ok(preferred);
         }
         return Ok(legacy);
     }
-    Err(format!("Not found: {} (or xray.exe)", preferred.display()))
+    #[cfg(not(windows))]
+    {
+        for sys_path in ["/usr/local/bin/avel-core", "/usr/local/bin/xray", "/usr/bin/xray"] {
+            let p = PathBuf::from(sys_path);
+            if p.exists() {
+                return Ok(p);
+            }
+        }
+    }
+    Err(format!("Not found: {} (or {})", preferred.display(), legacy_name))
 }
 
 pub fn runtime_config_path() -> PathBuf {
