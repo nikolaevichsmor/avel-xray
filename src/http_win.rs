@@ -485,9 +485,15 @@ pub fn probe_http_proxy_real_delay(
         if h_session.is_null() {
             return 0;
         }
-        WinHttpSetTimeouts(h_session, 3000, 3500, 3500, 4000);
+        WinHttpSetTimeouts(h_session, 2000, 2500, 2500, 3000);
         let h_connect = WinHttpConnect(h_session, host.as_ptr(), 443, 0);
         if h_connect.is_null() {
+            WinHttpCloseHandle(h_session);
+            return 0;
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            WinHttpCloseHandle(h_connect);
             WinHttpCloseHandle(h_session);
             return 0;
         }
