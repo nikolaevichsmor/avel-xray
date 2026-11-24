@@ -17,6 +17,7 @@ permissions:
 env:
   XRAY_VERSION: v26.11.9
   XRAY_ZIP_SHA256: 1262522266337b824f07beb8e1375786b437683b3890105469088f8e17e0a69d
+  XRAY_LINUX_ZIP_SHA256: b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82
   WINTUN_VERSION: 0.14.1
   WINTUN_ZIP_SHA256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
 
@@ -109,13 +110,100 @@ jobs:
             ${{ steps.pkg.outputs.zip }}
             dist/SHA256SUMS.txt
 
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download and verify Xray-core (Linux x64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p core tmp_dl
+          curl -fsSL "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -o tmp_dl/Xray-linux-64.zip
+          echo "${XRAY_LINUX_ZIP_SHA256}  tmp_dl/Xray-linux-64.zip" | sha256sum -c -
+          unzip -qo tmp_dl/Xray-linux-64.zip -d tmp_dl/xray
+          cp tmp_dl/xray/xray core/avel-core
+          chmod +x core/avel-core
+          cp tmp_dl/xray/geoip.dat core/geoip.dat
+          cp tmp_dl/xray/geosite.dat core/geosite.dat
+
+      - name: Run unit and Xray config tests
+        shell: bash
+        run: cargo test --locked
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --locked
+
+      - name: Package portable tar.gz and SHA256SUMS-linux
+        id: pkg
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            ver="${GITHUB_REF_NAME}"
+          elif [ -n "${INPUT_TAG:-}" ]; then
+            ver="${INPUT_TAG}"
+          else
+            ver="dev"
+          fi
+
+          stage="dist/avel-xray"
+          mkdir -p "${stage}/core"
+          cp target/release/avel "${stage}/avel"
+          chmod +x "${stage}/avel"
+          cp core/avel-core "${stage}/core/avel-core"
+          chmod +x "${stage}/core/avel-core"
+          cp core/geoip.dat "${stage}/core/geoip.dat"
+          cp core/geosite.dat "${stage}/core/geosite.dat"
+          cp LICENSE "${stage}/LICENSE"
+          cp THIRD_PARTY_LICENSES.txt "${stage}/THIRD_PARTY_LICENSES.txt"
+
+          tarName="avel-xray-${ver}-linux-x64.tar.gz"
+          tar -C dist -czf "dist/${tarName}" avel-xray
+
+          (
+            cd dist
+            sha256sum "${tarName}" "avel-xray/avel" "avel-xray/core/avel-core" > SHA256SUMS-linux.txt
+          )
+
+          echo "ver=${ver}" >> "$GITHUB_OUTPUT"
+          echo "archive=dist/${tarName}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: avel-xray-${{ steps.pkg.outputs.ver }}-linux-x64
+          path: |
+            ${{ steps.pkg.outputs.archive }}
+            dist/SHA256SUMS-linux.txt
+
+  publish-release:
+    needs: [build-windows, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          gh release create $tag "${{ steps.pkg.outputs.zip }}" dist/SHA256SUMS.txt `
-            --title "avel-xray $tag" `
-            --notes "Portable Windows x64 build with Xray-core $env:XRAY_VERSION and Wintun $env:WINTUN_VERSION. Extract and run avel.exe."
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh release create "${tag}" \
+            --repo "${{ github.repository }}" \
+            "release-assets/avel-xray-${tag}-windows-x64.zip" \
+            "release-assets/SHA256SUMS.txt" \
+            "release-assets/avel-xray-${tag}-linux-x64.tar.gz" \
+            "release-assets/SHA256SUMS-linux.txt" \
+            --title "avel-xray ${tag}" \
+            --notes "Portable Windows x64 GUI (Xray-core ${XRAY_VERSION} + Wintun ${WINTUN_VERSION}) and Linux x64 TUI/CLI (Xray-core ${XRAY_VERSION}) builds."
